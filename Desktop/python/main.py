@@ -23,3 +23,14 @@ a=int(a)
 print(a)
 
 
+if(a>=10 and a<=20 ):
+    print("a is between 10 and 20")
+
+    if(a>=10 or a<=20 ):
+        print("a is between 10 and 20")
+
+        if(not (a<=20 )):
+            print("a is between 10 and 20")
+    
+
+
