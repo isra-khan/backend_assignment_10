@@ -1,0 +1,58 @@
+name: cabby_lite
+description: "Cabby Captain - QR-driven captain companion app"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  # Live trip map — Mapbox. Draws the pickup→drop-off route and a live car
+  # puck at the captain's current GPS location.
+  mapbox_maps_flutter: ^2.26.0
+  # Captain's live location that drives the car puck on the map.
+  geolocator: ^14.0.3
+  # Loads the Mapbox access token from lib/.env (kept out of source control).
+  flutter_dotenv: ^6.0.1
+  # Captain login is QR-only — mobile_scanner drives the camera scan.
+  mobile_scanner: ^7.1.2
+  # Ride summary shows a scannable QR the rider uses to pay.
+  qr_flutter: ^4.1.0
+  provider: ^6.1.5+1
+  intl: ^0.20.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+    # Mapbox access token, loaded at startup by flutter_dotenv.
+    - lib/.env
+
+  # Inter, bundled rather than fetched at runtime so the first launch renders
+  # in-brand and the app works offline. SIL Open Font License. Matches the main
+  # Cabby app's type system exactly.
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Inter-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Inter-ExtraBold.ttf
+          weight: 800
