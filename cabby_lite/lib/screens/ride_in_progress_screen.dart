@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import '../config/layout.dart';
 import '../config/palette.dart';
 import '../config/tone.dart';
+import '../core/polyline.dart';
 import '../models/trip.dart';
 import '../state/location_service.dart';
 import '../state/ride_controller.dart';
@@ -49,6 +50,20 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   // The car's current position — starts at the pickup and moves to the live
   // GPS fix as soon as one arrives.
   GeoPoint? _carAt;
+
+  /// The road already driven. Seeded from the ride's `locationHistory` and
+  /// extended by every position the car reaches while this screen is up, so the
+  /// trail keeps growing rather than freezing at whatever the backend last knew.
+  List<GeoPoint> _trail = const [];
+
+  /// The drawn trail, held so it can be updated in place. Null until there are
+  /// enough points to make a line.
+  mb.PolylineAnnotation? _trailLine;
+
+  /// Watches the controller for tracker positions. Attached for the whole ride
+  /// alongside [_locSub] — each no-ops while the other's source is the live
+  /// one, so a `locationSource` arriving mid-ride switches the map over.
+  VoidCallback? _trackerListener;
   bool _ending = false;
 
   /// Which way the map frames the drive. Starts in overview so the captain sees
@@ -73,6 +88,13 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   @override
   void dispose() {
     _locSub?.cancel();
+    // The controller outlives this screen, so a listener left attached would
+    // keep firing into a disposed State.
+    final listener = _trackerListener;
+    if (listener != null) {
+      context.read<RideController>().removeListener(listener);
+      _trackerListener = null;
+    }
     super.dispose();
   }
 
@@ -161,17 +183,47 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     _lines = await map.annotations.createPolylineAnnotationManager();
     _points = await map.annotations.createPointAnnotationManager();
 
-    // Pickup is the captain's current location (fall back to the trip's stored
-    // pickup only when there's no GPS fix), so the route starts from where the
-    // captain actually is.
-    _pickup = await LocationService.current() ?? trip.pickupLocation;
+    // Where the route starts. The backend's `captainPosition` is authoritative
+    // and already loaded, so it draws the car correctly on frame 1 — including
+    // in a tracker vehicle, where this tablet's own GPS is the wrong source
+    // entirely. Only fall back to a local fix when the backend sent none.
+    if (!mounted) return;
+    final ctrl = context.read<RideController>();
+    _pickup = ctrl.captainPosition ??
+        (ctrl.usesDeviceGps ? await LocationService.current() : null) ??
+        trip.pickupLocation;
 
-    // Route line pickup → drop-off.
+    // The road already driven, drawn first so the route line above reads as
+    // "still to go". Matters most after an ignition cycle mid-ride: without it
+    // a trip twenty minutes in looks identical to one that just started.
+    //
+    // Two points minimum — a single fix is a dot, not a trail.
+    _trail = List<GeoPoint>.of(trip.locationHistory);
+    if (_trail.length >= 2) {
+      _trailLine = await _lines!.create(mb.PolylineAnnotationOptions(
+        geometry: mb.LineString(
+          coordinates: _trail.map((p) => _pt(p).coordinates).toList(),
+        ),
+        lineColor: Palette.zinc950.toARGB32(),
+        lineOpacity: 0.35,
+        lineWidth: 4,
+        lineJoin: mb.LineJoin.ROUND,
+      ));
+    }
+
+    // Route line. The backend's encoded polyline follows the actual roads;
+    // without one, fall back to a straight pickup → drop-off line so the
+    // captain still sees the direction of travel.
+    final route = Polyline.decode(trip.routePolyline);
     await _lines!.create(mb.PolylineAnnotationOptions(
-      geometry: mb.LineString(coordinates: [
-        _pt(_pickup!).coordinates,
-        _pt(trip.destinationLocation).coordinates,
-      ]),
+      geometry: mb.LineString(
+        coordinates: route.length >= 2
+            ? route.map((p) => _pt(p).coordinates).toList()
+            : [
+                _pt(_pickup!).coordinates,
+                _pt(trip.destinationLocation).coordinates,
+              ],
+      ),
       lineColor: Palette.brand.toARGB32(),
       lineWidth: 5,
       lineJoin: mb.LineJoin.ROUND,
@@ -209,8 +261,50 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     }
     await _placeCar();
     await _fitRoute(trip);
+    // Both attach; each filters per fix on the live `locationSource`, so the
+    // map follows the right source even when the answer arrives after this ran.
+    // Only one ever acts at a time — the two guards are exact opposites.
     _followLocation(trip);
+    _followTracker();
   }
+
+  /// Extend the driven trail to [point] and redraw it.
+  ///
+  /// Ignores movement under [_trailMinMetres] so a car idling at a light doesn't
+  /// accumulate hundreds of near-identical points from GPS jitter.
+  Future<void> _extendTrail(GeoPoint point) async {
+    final mgr = _lines;
+    if (mgr == null) return;
+
+    if (_trail.isNotEmpty &&
+        LocationService.distanceMetres(_trail.last, point) < _trailMinMetres) {
+      return;
+    }
+
+    _trail = [..._trail, point];
+    if (_trail.length < 2) return;
+
+    final coordinates = _trail.map((p) => _pt(p).coordinates).toList();
+    final line = _trailLine;
+    if (line == null) {
+      // First time there are two points to join — the ride began with an empty
+      // or single-entry history.
+      _trailLine = await mgr.create(mb.PolylineAnnotationOptions(
+        geometry: mb.LineString(coordinates: coordinates),
+        lineColor: Palette.zinc950.toARGB32(),
+        lineOpacity: 0.35,
+        lineWidth: 4,
+        lineJoin: mb.LineJoin.ROUND,
+      ));
+    } else {
+      line.geometry = mb.LineString(coordinates: coordinates);
+      await mgr.update(line);
+    }
+  }
+
+  /// Below this, a new fix is GPS noise rather than travel. Matches the 5m
+  /// distance filter the location stream itself uses.
+  static const double _trailMinMetres = 5;
 
   /// Draw (or move) the car marker at [_carAt] using the bundled car image.
   Future<void> _placeCar() async {
@@ -236,9 +330,23 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   /// Each fix also refreshes the distance-to-drop-off the nav banner reads
   /// from, and — in driving mode — steers the camera to the new heading so the
   /// map turns with the car.
+  ///
+  /// Only runs when this tablet IS the location source. In a tracker vehicle
+  /// the car's position arrives over the socket as `my-location`, and the
+  /// tablet's own GPS is a second, disagreeing opinion — following it would
+  /// fight the authoritative one.
   void _followLocation(Trip trip) {
     _locSub?.cancel();
     _locSub = LocationService.fixStream().listen((fix) async {
+      // Checked per fix, not once at subscribe time. `locationSource` is only
+      // known after `/captain/active-ride` answers, which can land well after
+      // this screen mounted off a `ride-started` socket event — so the choice
+      // of source has to be re-made on every fix rather than frozen on the
+      // first. `mounted` first: this fires from a stream that outlives the
+      // widget, and `context.read` on a defunct element throws.
+      if (!mounted) return;
+      if (!context.read<RideController>().usesDeviceGps) return;
+
       _carAt = fix.point;
       // Hold the last good bearing when stationary; a parked car reports noise.
       if (fix.heading != null) _bearing = fix.heading!;
@@ -250,8 +358,53 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
       if (mounted) setState(() => _remainingMetres = remaining);
 
       await _placeCar();
+      await _extendTrail(fix.point);
       await _cameraToCar(animate: true);
     });
+  }
+
+  /// Follow tracker positions pushed over the socket.
+  ///
+  /// The mirror of [_followLocation] for a tracker vehicle, where this tablet's
+  /// GPS is not the source: `my-location` lands on the controller as
+  /// `captainPosition`, and this moves the car and grows the trail off it so
+  /// both sources drive the map through the same code.
+  void _followTracker() {
+    _trackerListener = () async {
+      if (!mounted) return;
+      final ctrl = context.read<RideController>();
+      // The mirror of the guard in [_followLocation]: re-decided per
+      // notification, so a `locationSource` that arrives after this screen
+      // mounted switches the map over without needing a remount.
+      if (ctrl.usesDeviceGps) return;
+
+      final at = ctrl.captainPosition;
+      // `identical` rather than ==: GeoPoint has no value equality, so this
+      // only skips a repeat notification carrying the very same object. Real
+      // de-duplication is the distance guard in _extendTrail.
+      if (at == null || identical(at, _carAt)) return;
+
+      // Aim the camera along the direction of travel; a tracker fix carries no
+      // heading by the time it reaches the controller.
+      final from = _carAt;
+      if (from != null &&
+          LocationService.distanceMetres(from, at) >= _trailMinMetres) {
+        _bearing = LocationService.bearing(from, at);
+      }
+      _carAt = at;
+
+      final trip = ctrl.trip;
+      if (trip != null) {
+        final remaining =
+            LocationService.distanceMetres(at, trip.destinationLocation);
+        if (mounted) setState(() => _remainingMetres = remaining);
+      }
+
+      await _placeCar();
+      await _extendTrail(at);
+      await _cameraToCar(animate: true);
+    };
+    context.read<RideController>().addListener(_trackerListener!);
   }
 
   Future<void> _end(RideController ctrl) async {
@@ -271,8 +424,11 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     final layout = context.layout;
     // On a tablet the trip panel and nav banner float as cards with a capped
     // width instead of spanning the whole screen; on a phone they stay full-
-    // bleed as before.
-    final panelMaxWidth = layout.isTablet ? 460.0 : double.infinity;
+    // bleed as before. Phones resolve to the real screen width rather than
+    // double.infinity — the panels sit inside an AnimatedSize, which sizes to
+    // its child and would otherwise hand a `width: double.infinity` panel an
+    // unbounded constraint.
+    final panelMaxWidth = layout.isTablet ? 460.0 : layout.width;
 
     return Scaffold(
       body: Stack(
@@ -347,8 +503,15 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
                 layout.isTablet ? Alignment.bottomLeft : Alignment.bottomCenter,
             child: Padding(
               padding: EdgeInsets.all(layout.isTablet ? 16 : 0),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: panelMaxWidth),
+              // A hard width, not just a max: AnimatedSize measures its child
+              // against unbounded width, which an interior Row with a flexible
+              // child (or a Spacer) cannot resolve. Pinning the width here
+              // keeps the cross-fade between the two panels animating the
+              // height only, which is all that should change anyway.
+              child: SizedBox(
+                // Tablets: the capped floating-card width. Phones: full-bleed
+                // (the surrounding padding is zero there).
+                width: layout.isTablet ? panelMaxWidth : layout.width,
                 // Driving mode swaps the full rider/route panel for a compact
                 // strip — the captain's eyes belong on the road, and the map
                 // gets the space back.
@@ -357,7 +520,7 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
                   curve: Curves.easeOut,
                   alignment: Alignment.bottomCenter,
                   child: _driving
-                      ? _DrivingPanel(
+                      ? DrivingPanel(
                           trip: trip,
                           busy: _ending,
                           floating: layout.isTablet,
@@ -366,9 +529,7 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
                         )
                       : _TripPanel(
                           trip: trip,
-                          busy: _ending,
                           floating: layout.isTablet,
-                          onEnd: () => _end(ctrl),
                         ),
                 ),
               ),
@@ -516,8 +677,13 @@ class _ModeButton extends StatelessWidget {
 /// The pared-back bottom strip shown while driving: distance/ETA, the rider's
 /// name, a call button and "End ride". Everything else (fare breakdown, full
 /// route card, chat) waits for overview mode.
-class _DrivingPanel extends StatelessWidget {
-  const _DrivingPanel({
+///
+/// Public only so the layout tests can render it without a Mapbox platform
+/// view; nothing outside this file should build it directly.
+@visibleForTesting
+class DrivingPanel extends StatelessWidget {
+  const DrivingPanel({
+    super.key,
     required this.trip,
     required this.busy,
     required this.onEnd,
@@ -538,6 +704,9 @@ class _DrivingPanel extends StatelessWidget {
     final distance = remainingMetres;
 
     return Container(
+      // Fills the width its parent allots. Without this the Container sizes to
+      // its child, handing the Row below an unbounded width that its flexible
+      // child can't resolve.
       width: double.infinity,
       decoration: BoxDecoration(
         color: tone.card,
@@ -559,38 +728,52 @@ class _DrivingPanel extends StatelessWidget {
           ),
           child: Row(
             children: [
-              Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    distance != null
-                        ? _formatDistance(distance)
-                        : '${trip.km.toStringAsFixed(1)} km',
-                    style: TextStyle(
-                      fontSize: layout.scale(20),
-                      fontWeight: FontWeight.w800,
-                      color: tone.brand,
-                      height: 1.1,
+              // Expanded rather than a trailing Spacer: this row is measured at
+              // unbounded width by the AnimatedSize that wraps the panel, and a
+              // Spacer contributes no intrinsic width — the button after it
+              // would be handed an infinite constraint. Flexing the text block
+              // also lets the rider name ellipsize instead of overflowing.
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      distance != null
+                          ? _formatDistance(distance)
+                          : '${trip.km.toStringAsFixed(1)} km',
+                      style: TextStyle(
+                        fontSize: layout.scale(20),
+                        fontWeight: FontWeight.w800,
+                        color: tone.brand,
+                        height: 1.1,
+                      ),
                     ),
-                  ),
-                  Text(
-                    '${trip.minutes} min · ${trip.riderName}',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: layout.scale(12), color: tone.muted),
-                  ),
-                ],
+                    Text(
+                      '${trip.minutes} min · ${trip.riderName}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          fontSize: layout.scale(12), color: tone.muted),
+                    ),
+                  ],
+                ),
               ),
               SizedBox(width: layout.scale(12)),
               _CircleAction(icon: Icons.call, onTap: () {}),
-              const Spacer(),
+              SizedBox(width: layout.scale(8)),
               FilledButton(
                 style: FilledButton.styleFrom(
                   backgroundColor: Palette.danger,
                   padding:
                       EdgeInsets.symmetric(horizontal: layout.scale(20)),
+                  // The app theme sets `Size.fromHeight(52)`, whose width is
+                  // `double.infinity` — right for a full-bleed button in a
+                  // Column, fatal here. This button is a non-flexible child of
+                  // a Row, so an infinite minimum width propagates straight
+                  // down to the Material ink surface and asserts. Keep the
+                  // height, let the width size to the label.
+                  minimumSize: Size(0, layout.scale(52)),
                 ),
                 onPressed: busy ? null : onEnd,
                 child: busy ? const ButtonSpinner() : const Text('End ride'),
@@ -606,13 +789,9 @@ class _DrivingPanel extends StatelessWidget {
 class _TripPanel extends StatelessWidget {
   const _TripPanel({
     required this.trip,
-    required this.busy,
-    required this.onEnd,
     this.floating = false,
   });
   final Trip trip;
-  final bool busy;
-  final VoidCallback onEnd;
 
   /// When true the panel is a fully-rounded floating card (tablet); otherwise a
   /// full-width bottom sheet rounded only at the top (phone).
@@ -694,31 +873,11 @@ class _TripPanel extends StatelessWidget {
                       ],
                     ),
                   ),
-                  _CircleAction(
-                    icon: Icons.call,
-                    onTap: () {},
-                  ),
-                  SizedBox(width: layout.scale(8)),
-                  _CircleAction(
-                    icon: Icons.chat_bubble_outline,
-                    onTap: () {},
-                  ),
                 ],
               ),
               SizedBox(height: layout.scale(14)),
 
               RouteCard(pickup: trip.pickup, destination: trip.destination),
-              SizedBox(height: layout.scale(14)),
-
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton(
-                  style:
-                      FilledButton.styleFrom(backgroundColor: Palette.danger),
-                  onPressed: busy ? null : onEnd,
-                  child: busy ? const ButtonSpinner() : const Text('End ride'),
-                ),
-              ),
             ],
           ),
         ),

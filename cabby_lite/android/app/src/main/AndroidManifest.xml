@@ -1,11 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Captain login scans a QR (mobile_scanner); the live trip uses maps. -->
-    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Pairing, the ride feed and maps all need the network. No CAMERA: this
+         tablet displays the pairing QR, the captain's phone scans it. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Live car puck on the trip map needs the captain's GPS location. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:label="Cabby Captain"

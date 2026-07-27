@@ -206,29 +206,39 @@ class _FareCard extends StatelessWidget {
                     fontWeight: FontWeight.w800,
                   ),
                 ),
-                Text(
-                  'Your earning · PKR ${b.captainPayout}',
-                  style: TextStyle(
-                      color: Colors.white70, fontSize: layout.scale(13)),
-                ),
+                // The payout is only knowable when we have the component split
+                // — it is the total minus the platform's cut. A backend fare
+                // arrives as one number, so there is nothing to subtract and
+                // the line is omitted rather than guessed at.
+                if (trip.hasFareBreakdown)
+                  Text(
+                    'Your earning · PKR ${b.captainPayout}',
+                    style: TextStyle(
+                        color: Colors.white70, fontSize: layout.scale(13)),
+                  ),
               ],
             ),
           ),
-          Padding(
-            padding: EdgeInsets.fromLTRB(layout.scale(16), layout.scale(12),
-                layout.scale(16), layout.scale(14)),
-            child: Column(
-              children: [
-                line('Base fare', b.base),
-                line('Distance (${trip.km.toStringAsFixed(1)} km)', b.distance),
-                line('Time (${trip.minutes} min)', b.time),
-                line('Platform fee', b.platformFee),
-                line('Tax', b.tax),
-                Divider(color: tone.ring, height: layout.scale(20)),
-                line('Total', b.total, strong: true),
-              ],
+          // Likewise the line items. `/captain/active-ride` and the
+          // `ride-ended` payload both send a flat `fare`, so rendering the
+          // breakdown there would print five confident zeroes.
+          if (trip.hasFareBreakdown)
+            Padding(
+              padding: EdgeInsets.fromLTRB(layout.scale(16), layout.scale(12),
+                  layout.scale(16), layout.scale(14)),
+              child: Column(
+                children: [
+                  line('Base fare', b.base),
+                  line('Distance (${trip.km.toStringAsFixed(1)} km)',
+                      b.distance),
+                  line('Time (${trip.minutes} min)', b.time),
+                  line('Platform fee', b.platformFee),
+                  line('Tax', b.tax),
+                  Divider(color: tone.ring, height: layout.scale(20)),
+                  line('Total', b.total, strong: true),
+                ],
+              ),
             ),
-          ),
         ],
       ),
     );

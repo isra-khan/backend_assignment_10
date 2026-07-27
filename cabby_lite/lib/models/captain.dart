@@ -1,5 +1,6 @@
-/// The signed-in captain. In this companion app the profile is decoded from the
-/// login QR payload (or a demo default), not fetched from a backend.
+/// The captain this tablet is paired to. The profile arrives from the backend
+/// in the `linked` pairing response — it is not decoded from the QR, which
+/// carries nothing but the pairing code.
 class Captain {
   final String name;
   final String phone;
@@ -24,38 +25,29 @@ class Captain {
     return (parts.first[0] + parts.last[0]).toUpperCase();
   }
 
-  /// Build a captain from a scanned QR payload. Accepts a few shapes so a demo
-  /// QR encoding just a name still logs in; unknown/blank scans fall back to a
-  /// sensible default rather than failing the login.
-  factory Captain.fromScan(String raw) {
-    final value = raw.trim();
-    if (value.isEmpty) return Captain.demo();
+  /// Build a captain from the `captain` object in a `linked` pairing response:
+  /// `{ "fullname": { "firstname", "lastname" }, "vehicleNumber": "AQC-858" }`.
+  ///
+  /// Fields are read defensively — the plate in particular can be absent when
+  /// an unprovisioned tablet pairs, and a missing name must not cost the
+  /// captain their session, so it degrades to "Captain" rather than throwing.
+  factory Captain.fromPairing(Map<String, dynamic> json) {
+    final fullname = json['fullname'];
+    final name = fullname is Map
+        ? [fullname['firstname'], fullname['lastname']]
+            .whereType<String>()
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .join(' ')
+        : fullname?.toString().trim() ?? '';
 
-    // Supported demo format: `cabby-captain:Name|Phone|type|NUMBER|color|seats`
-    if (value.startsWith('cabby-captain:')) {
-      final parts = value.substring('cabby-captain:'.length).split('|');
-      String at(int i) => i < parts.length ? parts[i].trim() : '';
-      return Captain(
-        name: at(0).isEmpty ? 'Captain' : at(0),
-        phone: at(1),
-        vehicleType: at(2).isEmpty ? 'car' : at(2),
-        vehicleNumber: at(3),
-        vehicleColor: at(4),
-        seats: int.tryParse(at(5)) ?? 4,
-      );
-    }
-
-    // Any other payload — treat the whole thing as an ID and sign in as a
-    // generic verified captain so the demo flow proceeds.
-    return Captain.demo();
+    return Captain(
+      name: name.isEmpty ? 'Captain' : name,
+      phone: json['phone']?.toString() ?? '',
+      vehicleType: json['vehicleType']?.toString() ?? 'car',
+      vehicleNumber: json['vehicleNumber']?.toString() ?? '',
+      vehicleColor: json['vehicleColor']?.toString() ?? '',
+      seats: int.tryParse(json['seats']?.toString() ?? '') ?? 4,
+    );
   }
-
-  factory Captain.demo() => const Captain(
-        name: 'Bilal Ahmed',
-        phone: '+92 321 9876543',
-        vehicleType: 'car',
-        vehicleNumber: 'ACX-472',
-        vehicleColor: 'White',
-        seats: 4,
-      );
 }

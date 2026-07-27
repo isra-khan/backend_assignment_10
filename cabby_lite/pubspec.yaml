@@ -17,20 +17,33 @@ dependencies:
   mapbox_maps_flutter: ^2.26.0
   # Captain's live location that drives the car puck on the map.
   geolocator: ^14.0.3
-  # Loads the Mapbox access token from lib/.env (kept out of source control).
+  # Loads the Mapbox token and the server URL from lib/.env (out of source
+  # control).
   flutter_dotenv: ^6.0.1
-  # Captain login is QR-only — mobile_scanner drives the camera scan.
-  mobile_scanner: ^7.1.2
-  # Ride summary shows a scannable QR the rider uses to pay.
+  # This tablet *displays* QRs, it never scans one. The pairing screen renders
+  # the code from /device/pair/start; the ride summary renders the payment QR.
   qr_flutter: ^4.1.0
+  # Same HTTP client as the Cabby phone app, so the `token` header handling and
+  # error shapes stay identical across the two apps.
+  dio: ^5.10.0
+  # The device token lives in the keystore, not in plain prefs — it is a
+  # year-long credential for this vehicle.
+  flutter_secure_storage: ^10.3.1
+  # deviceId, which must outlive a reboot.
+  shared_preferences: ^2.5.5
   provider: ^6.1.5+1
   intl: ^0.20.3
+  # The ride feed. This tablet only ever listens — it never emits an event and
+  # never posts a location.
+  socket_io_client: ^3.1.6
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
 
   flutter_lints: ^6.0.0
+
+  flutter_launcher_icons: ^0.14.4
 
 flutter:
   uses-material-design: true
@@ -56,3 +69,19 @@ flutter:
           weight: 700
         - asset: assets/fonts/Inter-ExtraBold.ttf
           weight: 800
+
+# App launcher icon, shared with the main Cabby app so both read as one brand.
+# Regenerate with: dart run flutter_launcher_icons
+flutter_launcher_icons:
+  image_path: "assets/icon/app_icon.png"
+  android: true
+  # Adaptive icon: brand green plate + the chevrons, padded for the mask.
+  adaptive_icon_background: "#0A7C42"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+  ios: true
+  # iOS forbids alpha in app icons — flatten the rounded corners away.
+  remove_alpha_ios: true
+  web:
+    generate: true
+    background_color: "#0A7C42"
+    theme_color: "#0A7C42"

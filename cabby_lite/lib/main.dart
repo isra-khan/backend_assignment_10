@@ -4,6 +4,7 @@ import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart'
     show MapboxOptions;
 import 'package:provider/provider.dart';
 
+import 'config/env.dart';
 import 'config/layout.dart';
 import 'config/palette.dart';
 import 'config/theme.dart';
@@ -12,19 +13,20 @@ import 'state/ride_controller.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Load the Mapbox token from lib/.env and hand it to the SDK before any map
-  // is built — the live-trip map renders blank without it.
+  // lib/.env carries the Mapbox token and the backend URL. Load it before
+  // runApp: the map renders blank without the token, and pairing can't start
+  // without the server URL.
   await dotenv.load(fileName: 'lib/.env');
-  final token = dotenv.env['MAPBOX_TOKEN'];
-  if (token != null && token.isNotEmpty) {
-    MapboxOptions.setAccessToken(token);
+  if (Env.mapboxToken.isNotEmpty) {
+    MapboxOptions.setAccessToken(Env.mapboxToken);
   }
   runApp(const CabbyCaptainApp());
 }
 
-/// Cabby Captain — the QR-driven companion app for captains. Shares the Cabby
-/// Mobile design system (Palette, AppTone, AppTheme, Inter) so it reads as part
-/// of the same product family.
+/// Cabby Lite — the in-car tablet companion. Pairs to a captain by displaying a
+/// QR their phone scans, then runs receive-only for the rest of its life.
+/// Shares the Cabby Mobile design system (Palette, AppTone, AppTheme, Inter) so
+/// it reads as part of the same product family.
 class CabbyCaptainApp extends StatelessWidget {
   const CabbyCaptainApp({super.key});
 
