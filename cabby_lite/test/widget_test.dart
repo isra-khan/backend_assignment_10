@@ -257,6 +257,41 @@ void main() {
       expect(fix.at, isNotNull);
     });
 
+    // The socket's ride payloads omit `pickupLocation` entirely and put the
+    // coordinates in the `pickup` text field instead. Without a fallback both
+    // pins land at (0, 0) and the map frames the Gulf of Guinea.
+    test('a "lat,lng" pickup string still yields a real point', () {
+      final trip = Trip.fromActiveRide(const {
+        '_id': '09bec09e',
+        'pickup': '24.9337937,67.0289403',
+        'destination': 'Aptech Computer Education, Garden Road, Karachi',
+      });
+
+      expect(trip.pickupLocation.latitude, closeTo(24.9337937, 1e-9));
+      expect(trip.pickupLocation.longitude, closeTo(67.0289403, 1e-9));
+      expect(trip.pickupLocation.isUnset, isFalse);
+      // A real address is not coordinates — it must not parse into a point.
+      expect(trip.destinationLocation.isUnset, isTrue);
+    });
+
+    test('structured pickupLocation still wins over the text field', () {
+      final trip = Trip.fromActiveRide(const {
+        '_id': 'r1',
+        'pickup': '1.0,2.0',
+        'pickupLocation': {'lat': 24.8138, 'lng': 67.0300},
+      });
+
+      expect(trip.pickupLocation.latitude, closeTo(24.8138, 1e-9));
+    });
+
+    test('out-of-range numbers are not coordinates', () {
+      // "Block 4, 200" splits into two parsable numbers by accident.
+      expect(GeoPoint.fromLatLngString('91.0,10.0'), isNull);
+      expect(GeoPoint.fromLatLngString('10.0,181.0'), isNull);
+      expect(GeoPoint.fromLatLngString('Garden Road, Saddar'), isNull);
+      expect(GeoPoint.fromLatLngString(''), isNull);
+    });
+
     test('a fix with no coordinates is not a fix', () {
       // Better no marker movement than a jump to (0, 0) in the Gulf of Guinea.
       expect(TrackerFix.fromJson(const {'heading': 90}), isNull);
@@ -526,7 +561,12 @@ void main() {
         (tester) async {
       await pumpAt(tester, size, (c) => c.restorePairing());
       expect(tester.takeException(), isNull);
-      expect(find.text('Start next ride'), findsOneWidget);
+      // Standby shows the captain, never a rider: a ride only ever starts from
+      // a `ride-started` socket event, so there is no demo button to tap and no
+      // sample trip's details to leak onto this screen.
+      expect(find.text('Start next ride'), findsNothing);
+      expect(find.text('Ayesha Khan'), findsNothing);
+      expect(find.textContaining('Dolmen Mall'), findsNothing);
     });
 
     // The trip map itself can't render in tests (Mapbox needs a platform
@@ -563,10 +603,8 @@ void main() {
                             alignment: Alignment.bottomCenter,
                             child: DrivingPanel(
                               trip: Trip.sample(),
-                              busy: false,
                               floating: layout.isTablet,
                               remainingMetres: 2400,
-                              onEnd: () {},
                             ),
                           ),
                         ),
@@ -582,7 +620,8 @@ void main() {
       await tester.pump();
 
       expect(tester.takeException(), isNull);
-      expect(find.text('End ride'), findsOneWidget);
+      // The ride is ended from the captain's phone, never from this tablet.
+      expect(find.text('End ride'), findsNothing);
       // 2400m renders through the nav distance formatter.
       expect(find.text('2.4 km'), findsOneWidget);
     });

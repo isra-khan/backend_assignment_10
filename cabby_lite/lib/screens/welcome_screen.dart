@@ -5,7 +5,6 @@ import '../config/layout.dart';
 import '../config/palette.dart';
 import '../config/tone.dart';
 import '../models/captain.dart';
-import '../models/trip.dart';
 import '../state/ride_controller.dart';
 import '../widgets/brand_logo.dart';
 import '../widgets/status_pill.dart';
@@ -26,15 +25,6 @@ class WelcomeScreen extends StatelessWidget {
     // On a wide tablet the standby hero sits alongside the vehicle +
     // instructions rather than stacking, so the extra width is used.
     final twoColumn = layout.isWide;
-
-    final startButton = SizedBox(
-      width: double.infinity,
-      child: FilledButton.icon(
-        onPressed: () => ctrl.startTrip(Trip.sample()),
-        icon: Icon(Icons.navigation, size: layout.scale(18)),
-        label: const Text('Start next ride'),
-      ),
-    );
 
     return Scaffold(
       body: SafeArea(
@@ -118,13 +108,11 @@ class WelcomeScreen extends StatelessWidget {
                           _InstructionsCard(),
                         ],
 
+                        // Nothing follows the cards: a ride starts from a
+                        // `ride-started` socket event, never from a tap here.
+                        // The Spacer keeps the content top-aligned in a tall
+                        // viewport rather than stretching to fill it.
                         const Spacer(),
-                        SizedBox(height: layout.scale(24)),
-
-                        // Demo affordance: begin a sample trip. In production
-                        // this is triggered by an accepted dispatch, not a
-                        // button.
-                        startButton,
                       ],
                     ),
                   ),

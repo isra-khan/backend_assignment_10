@@ -1,5 +1,14 @@
 import 'dart:async';
+import 'dart:typed_data' show Uint8List;
+import 'dart:ui' as ui
+    show
+        PictureRecorder,
+        ImageByteFormat,
+        ParagraphBuilder,
+        ParagraphStyle,
+        ParagraphConstraints;
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mb;
@@ -27,8 +36,11 @@ enum MapMode { overview, driving }
 
 /// Live trip surface. Replaces the welcome screen the moment a ride starts: a
 /// full-bleed Mapbox navigation map with the trip's route drawn on it, a live
-/// car puck at the captain's GPS location, and a bottom panel carrying rider
-/// details and the "End ride" action.
+/// car puck at the captain's position, and a bottom panel carrying rider
+/// details.
+///
+/// The trip is ended from the captain's phone. This tablet is receive-only and
+/// moves to the summary when `ride-ended` arrives, never from a tap here.
 class RideInProgressScreen extends StatefulWidget {
   const RideInProgressScreen({super.key});
 
@@ -43,12 +55,16 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   mb.PointAnnotation? _carAnnotation;
   StreamSubscription<GeoFix>? _locSub;
 
-  // The pickup point — resolved to the captain's current GPS location when the
-  // trip starts (falls back to the trip's stored pickup with no fix).
-  GeoPoint? _pickup;
+  /// Where the CAR starts — the backend's `captainPosition`, falling back to a
+  /// device fix, and only to the trip's pickup when neither exists.
+  ///
+  /// Not the rider's pickup point: in a tracker vehicle the two can be
+  /// kilometres apart. Anything drawn as "the pickup" must read
+  /// `trip.pickupLocation` instead.
+  GeoPoint? _carStart;
 
-  // The car's current position — starts at the pickup and moves to the live
-  // GPS fix as soon as one arrives.
+  // The car's current position — starts at [_carStart] and moves to the live
+  // fix as soon as one arrives.
   GeoPoint? _carAt;
 
   /// The road already driven. Seeded from the ride's `locationHistory` and
@@ -64,7 +80,6 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   /// alongside [_locSub] — each no-ops while the other's source is the live
   /// one, so a `locationSource` arriving mid-ride switches the map over.
   VoidCallback? _trackerListener;
-  bool _ending = false;
 
   /// Which way the map frames the drive. Starts in overview so the captain sees
   /// the whole job before setting off.
@@ -85,6 +100,20 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   double get _modeZoom => _driving ? 17 : 15;
   double get _modePitch => _driving ? 55 : 0;
 
+  /// The controller, captured while the element tree is still stable.
+  ///
+  /// [dispose] must detach [_trackerListener], but an ancestor lookup there is
+  /// illegal — the element is already deactivated and Flutter throws "Looking
+  /// up a deactivated widget's ancestor is unsafe". Holding the reference from
+  /// [didChangeDependencies] is the documented way round it.
+  RideController? _controller;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _controller = context.read<RideController>();
+  }
+
   @override
   void dispose() {
     _locSub?.cancel();
@@ -92,7 +121,7 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     // keep firing into a disposed State.
     final listener = _trackerListener;
     if (listener != null) {
-      context.read<RideController>().removeListener(listener);
+      _controller?.removeListener(listener);
       _trackerListener = null;
     }
     super.dispose();
@@ -110,11 +139,20 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     if (map == null) return;
     if (_driving) return _cameraToCar(animate: true);
 
+    // Unset points are excluded: framing a (0, 0) placeholder alongside a real
+    // one zooms out to span half the planet and the trip becomes a dot.
+    //
+    // The car is framed separately from the pickup — in a tracker vehicle they
+    // can be kilometres apart, and the captain needs both in view to see how
+    // far they are from the rider.
     final pts = [
-      _pt(_pickup ?? trip.pickupLocation),
-      _pt(trip.destinationLocation),
-      if (_carAt != null) _pt(_carAt!),
+      if (!trip.pickupLocation.isUnset) _pt(trip.pickupLocation),
+      if (!trip.destinationLocation.isUnset) _pt(trip.destinationLocation),
+      if (_carAt != null && !_carAt!.isUnset) _pt(_carAt!),
     ];
+    // Nothing real to frame — leave the camera where it is rather than flying
+    // it to null island.
+    if (pts.isEmpty) return;
     final camera = await map.cameraForCoordinatesPadding(
       pts,
       mb.CameraOptions(bearing: 0, pitch: 0),
@@ -183,13 +221,16 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     _lines = await map.annotations.createPolylineAnnotationManager();
     _points = await map.annotations.createPointAnnotationManager();
 
-    // Where the route starts. The backend's `captainPosition` is authoritative
+    // Where the CAR starts. The backend's `captainPosition` is authoritative
     // and already loaded, so it draws the car correctly on frame 1 — including
     // in a tracker vehicle, where this tablet's own GPS is the wrong source
-    // entirely. Only fall back to a local fix when the backend sent none.
-    if (!mounted) return;
-    final ctrl = context.read<RideController>();
-    _pickup = ctrl.captainPosition ??
+    // entirely. Only fall back to a local fix when the backend sent none, and
+    // to the trip's pickup when there is no fix at all.
+    // Captured reference, not `context.read`: this runs after the map style
+    // has loaded, several awaits from where the widget was built.
+    final ctrl = _controller;
+    if (!mounted || ctrl == null) return;
+    _carStart = ctrl.captainPosition ??
         (ctrl.usesDeviceGps ? await LocationService.current() : null) ??
         trip.pickupLocation;
 
@@ -215,46 +256,77 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     // without one, fall back to a straight pickup → drop-off line so the
     // captain still sees the direction of travel.
     final route = Polyline.decode(trip.routePolyline);
-    await _lines!.create(mb.PolylineAnnotationOptions(
-      geometry: mb.LineString(
-        coordinates: route.length >= 2
-            ? route.map((p) => _pt(p).coordinates).toList()
-            : [
-                _pt(_pickup!).coordinates,
-                _pt(trip.destinationLocation).coordinates,
-              ],
-      ),
-      lineColor: Palette.brand.toARGB32(),
-      lineWidth: 5,
-      lineJoin: mb.LineJoin.ROUND,
-    ));
+    final hasRoad = route.length >= 2;
+    if (kDebugMode) {
+      final raw = trip.routePolyline;
+      debugPrint(hasRoad
+          ? '[map] route: ${route.length} points from routePolyline'
+          : '[map] route: STRAIGHT LINE fallback — routePolyline '
+              '${raw == null ? 'absent' : raw.isEmpty ? 'empty' : 'decoded to '
+                  '${route.length} pt(s) from ${raw.length} chars'}');
+    }
+    // The straight-line fallback runs pickup → drop-off, the trip the rider
+    // booked. Starting it at the car would draw a line the vehicle isn't going
+    // to take, and in a tracker vehicle parked kilometres away it would point
+    // in the wrong direction entirely.
+    final straightLine = !trip.pickupLocation.isUnset &&
+        !trip.destinationLocation.isUnset;
+    if (hasRoad || straightLine) {
+      await _lines!.create(mb.PolylineAnnotationOptions(
+        geometry: mb.LineString(
+          coordinates: hasRoad
+              ? route.map((p) => _pt(p).coordinates).toList()
+              : [
+                  _pt(trip.pickupLocation).coordinates,
+                  _pt(trip.destinationLocation).coordinates,
+                ],
+        ),
+        lineColor: Palette.brand.toARGB32(),
+        // Matches the phone app: 4px, rounded caps so the road geometry reads
+        // as a drawn route rather than a hard-edged bar.
+        lineWidth: 4,
+        lineJoin: mb.LineJoin.ROUND,
+      ));
+    }
 
-    // Pickup + drop-off pin markers.
-    await _points!.create(mb.PointAnnotationOptions(
-      geometry: _pt(_pickup!),
-      textField: 'Pickup',
-      textOffset: [0, -2],
-      textColor: Palette.brandAccent.toARGB32(),
-      iconColor: Palette.brandAccent.toARGB32(),
-      iconSize: 1.4,
-    ));
-    await _points!.create(mb.PointAnnotationOptions(
-      geometry: _pt(trip.destinationLocation),
-      textField: 'Drop off',
-      textOffset: [0, -2],
-      textColor: Palette.danger.toARGB32(),
-      iconColor: Palette.danger.toARGB32(),
-      iconSize: 1.4,
-    ));
+    // Pickup + drop-off pin markers. Skipped when the backend gave no usable
+    // coordinate: a pin at (0, 0) is the Gulf of Guinea, which drags the camera
+    // off the actual trip. The phone app does the same — no point, no pin.
+    // Same glyphs the phone app uses: a brand-green origin ring for the pickup
+    // and a red place pin for the drop-off, rather than text labels.
+    //
+    // Deliberately `trip.pickupLocation`, NOT `_pickup`: the latter is where
+    // the CAR starts (captainPosition, falling back to a device fix), which is
+    // only the pickup point by coincidence. Pinning it there put the "pickup"
+    // marker on the car and left the rider's actual pickup unmarked.
+    if (!trip.pickupLocation.isUnset) {
+      await _points!.create(mb.PointAnnotationOptions(
+        geometry: _pt(trip.pickupLocation),
+        image: await _iconImage(Icons.trip_origin, color: Palette.brand),
+        iconSize: 0.5,
+      ));
+    }
+    if (!trip.destinationLocation.isUnset) {
+      await _points!.create(mb.PointAnnotationOptions(
+        geometry: _pt(trip.destinationLocation),
+        image: await _iconImage(Icons.place, color: Palette.danger),
+        iconSize: 0.6,
+        // Anchor the pin's tip at the coordinate, not its centre — a place pin
+        // points at the spot below it.
+        iconAnchor: mb.IconAnchor.BOTTOM,
+      ));
+    }
 
-    // Car puck — starts at the pickup (the current location), then follows GPS.
-    _carAt = _pickup;
+    // Car puck — starts at the vehicle's last known position, then follows the
+    // live feed (tracker fixes or this tablet's GPS).
+    _carAt = _carStart;
     // Seed the banner's distance from the starting point so it reads sensibly
-    // before the first live fix arrives.
-    if (mounted) {
+    // before the first live fix arrives. Meaningless without a real drop-off,
+    // so it stays null there rather than reporting the distance to (0, 0).
+    if (mounted && !trip.destinationLocation.isUnset) {
       setState(() {
         _remainingMetres = LocationService.distanceMetres(
-          _pickup!,
+          _carStart!,
           trip.destinationLocation,
         );
       });
@@ -306,6 +378,47 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   /// distance filter the location stream itself uses.
   static const double _trailMinMetres = 5;
 
+  /// Rasterise a Material icon into PNG bytes for use as a Mapbox marker.
+  ///
+  /// The phone app draws its pins as Flutter `Icon` widgets, but Mapbox's
+  /// annotation API takes image bytes, so the same glyph is painted to a canvas
+  /// here. Keeps the two apps visually identical without shipping a PNG per
+  /// icon per density.
+  Future<Uint8List> _iconImage(
+    IconData icon, {
+    required Color color,
+    double size = 96,
+  }) async {
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
+      fontFamily: icon.fontFamily,
+      fontSize: size,
+    ))
+      ..pushStyle(TextStyle(
+        color: color,
+        fontSize: size,
+        fontFamily: icon.fontFamily,
+        package: icon.fontPackage,
+        // A white halo so a dark pin stays legible on a dark map tile.
+        shadows: const [
+          Shadow(color: Colors.white, blurRadius: 3),
+          Shadow(color: Colors.white, blurRadius: 6),
+        ],
+      ).getTextStyle())
+      ..addText(String.fromCharCode(icon.codePoint));
+
+    final paragraph = builder.build()
+      ..layout(ui.ParagraphConstraints(width: size * 1.4));
+    canvas.drawParagraph(paragraph, Offset.zero);
+
+    final image = await recorder
+        .endRecording()
+        .toImage((size * 1.4).ceil(), (size * 1.3).ceil());
+    final data = await image.toByteData(format: ui.ImageByteFormat.png);
+    return data!.buffer.asUint8List();
+  }
+
   /// Draw (or move) the car marker at [_carAt] using the bundled car image.
   Future<void> _placeCar() async {
     final mgr = _points;
@@ -342,10 +455,11 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
       // known after `/captain/active-ride` answers, which can land well after
       // this screen mounted off a `ride-started` socket event — so the choice
       // of source has to be re-made on every fix rather than frozen on the
-      // first. `mounted` first: this fires from a stream that outlives the
-      // widget, and `context.read` on a defunct element throws.
-      if (!mounted) return;
-      if (!context.read<RideController>().usesDeviceGps) return;
+      // first. Read through the captured controller rather than the context:
+      // this fires from a stream that outlives the widget, and an ancestor
+      // lookup on a defunct element throws.
+      final ctrl = _controller;
+      if (!mounted || ctrl == null || !ctrl.usesDeviceGps) return;
 
       _carAt = fix.point;
       // Hold the last good bearing when stationary; a parked car reports noise.
@@ -371,8 +485,8 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   /// both sources drive the map through the same code.
   void _followTracker() {
     _trackerListener = () async {
-      if (!mounted) return;
-      final ctrl = context.read<RideController>();
+      final ctrl = _controller;
+      if (!mounted || ctrl == null) return;
       // The mirror of the guard in [_followLocation]: re-decided per
       // notification, so a `locationSource` that arrives after this screen
       // mounted switches the map over without needing a remount.
@@ -404,15 +518,9 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
       await _extendTrail(at);
       await _cameraToCar(animate: true);
     };
-    context.read<RideController>().addListener(_trackerListener!);
-  }
-
-  Future<void> _end(RideController ctrl) async {
-    setState(() => _ending = true);
-    // Small pause so the button reads as doing work, then hand off to summary.
-    await Future.delayed(const Duration(milliseconds: 500));
-    if (!mounted) return;
-    ctrl.completeTrip();
+    // Attach through the same reference [dispose] will detach from, so the two
+    // can never end up on different controller instances.
+    _controller?.addListener(_trackerListener!);
   }
 
   @override
@@ -522,10 +630,8 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
                   child: _driving
                       ? DrivingPanel(
                           trip: trip,
-                          busy: _ending,
                           floating: layout.isTablet,
                           remainingMetres: _remainingMetres,
-                          onEnd: () => _end(ctrl),
                         )
                       : _TripPanel(
                           trip: trip,
@@ -675,8 +781,11 @@ class _ModeButton extends StatelessWidget {
 }
 
 /// The pared-back bottom strip shown while driving: distance/ETA, the rider's
-/// name, a call button and "End ride". Everything else (fare breakdown, full
-/// route card, chat) waits for overview mode.
+/// name and a call button. Everything else (fare breakdown, full route card,
+/// chat) waits for overview mode.
+///
+/// The ride is ended by the captain's phone, not here — this tablet is a
+/// receive-only device and learns the trip is over from `ride-ended`.
 ///
 /// Public only so the layout tests can render it without a Mapbox platform
 /// view; nothing outside this file should build it directly.
@@ -685,15 +794,11 @@ class DrivingPanel extends StatelessWidget {
   const DrivingPanel({
     super.key,
     required this.trip,
-    required this.busy,
-    required this.onEnd,
     this.remainingMetres,
     this.floating = false,
   });
 
   final Trip trip;
-  final bool busy;
-  final VoidCallback onEnd;
   final double? remainingMetres;
   final bool floating;
 
@@ -761,23 +866,6 @@ class DrivingPanel extends StatelessWidget {
               ),
               SizedBox(width: layout.scale(12)),
               _CircleAction(icon: Icons.call, onTap: () {}),
-              SizedBox(width: layout.scale(8)),
-              FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: Palette.danger,
-                  padding:
-                      EdgeInsets.symmetric(horizontal: layout.scale(20)),
-                  // The app theme sets `Size.fromHeight(52)`, whose width is
-                  // `double.infinity` — right for a full-bleed button in a
-                  // Column, fatal here. This button is a non-flexible child of
-                  // a Row, so an infinite minimum width propagates straight
-                  // down to the Material ink surface and asserts. Keep the
-                  // height, let the width size to the label.
-                  minimumSize: Size(0, layout.scale(52)),
-                ),
-                onPressed: busy ? null : onEnd,
-                child: busy ? const ButtonSpinner() : const Text('End ride'),
-              ),
             ],
           ),
         ),

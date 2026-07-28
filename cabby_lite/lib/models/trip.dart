@@ -21,6 +21,30 @@ class GeoPoint {
     return GeoPoint(lat, lng);
   }
 
+  /// Parse a `"lat,lng"` string, which is what the backend currently puts in
+  /// the `pickup` / `destination` *text* fields on socket ride payloads when it
+  /// has no street address for the point.
+  ///
+  /// Only used as a fallback after [fromLatLng] finds no structured location —
+  /// without it a ride whose payload omits `pickupLocation` lands the pin at
+  /// (0, 0), in the Gulf of Guinea, instead of at the pickup.
+  static GeoPoint? fromLatLngString(dynamic value) {
+    final text = value?.toString().trim() ?? '';
+    if (text.isEmpty) return null;
+    final parts = text.split(',');
+    if (parts.length != 2) return null;
+    final lat = double.tryParse(parts[0].trim());
+    final lng = double.tryParse(parts[1].trim());
+    if (lat == null || lng == null) return null;
+    // A real address ("Garden Road, Saddar, Karachi") splits into two parsable
+    // numbers only by accident; bound-checking keeps such a string out.
+    if (lat.abs() > 90 || lng.abs() > 180) return null;
+    return GeoPoint(lat, lng);
+  }
+
+  /// True when this is the null-island default rather than a real fix.
+  bool get isUnset => latitude == 0 && longitude == 0;
+
   /// Parse a GeoJSON `[lng, lat]` pair — longitude FIRST. Used only by
   /// `locationHistory.coordinates`.
   static GeoPoint? fromGeoJson(dynamic json) {
@@ -151,9 +175,14 @@ class Trip {
           user is Map ? GeoPoint._toDouble(user['rating']) : null,
       pickup: json['pickup']?.toString() ?? '',
       destination: json['destination']?.toString() ?? '',
-      pickupLocation:
-          GeoPoint.fromLatLng(json['pickupLocation']) ?? const GeoPoint(0, 0),
+      // Structured location first, per the guide. Socket ride payloads can omit
+      // it and carry the coordinates in the text field instead, so fall back to
+      // parsing that before giving up and landing the pin at (0, 0).
+      pickupLocation: GeoPoint.fromLatLng(json['pickupLocation']) ??
+          GeoPoint.fromLatLngString(json['pickup']) ??
+          const GeoPoint(0, 0),
       destinationLocation: GeoPoint.fromLatLng(json['destinationLocation']) ??
+          GeoPoint.fromLatLngString(json['destination']) ??
           const GeoPoint(0, 0),
       status: switch (json['status']?.toString()) {
         'ongoing' => RideStatus.ongoing,

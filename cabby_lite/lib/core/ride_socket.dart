@@ -176,6 +176,17 @@ class RideSocket {
       if (fix != null) onLocation(fix);
     });
 
+    // The captain unlinked this tablet. The backend force-disconnects the
+    // socket straight after sending this, and socket.io does NOT auto-reconnect
+    // from a server-initiated disconnect — so this event is the only signal an
+    // idle tablet gets. Without it a tablet sitting on the welcome screen makes
+    // no HTTP call, never sees a 401, and would keep showing a live session for
+    // a device that has been revoked.
+    socket.on('session-revoked', (d) {
+      _log('session-revoked', d, note: 'wiping token → QR screen');
+      onRevoked();
+    });
+
     // `new-ride` and `ride-taken` belong to the phone's request feed and are
     // deliberately not acted on. Logged only so the feed reads complete while
     // debugging — seeing them proves the socket is live and delivering.

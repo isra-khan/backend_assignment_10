@@ -402,7 +402,15 @@ class RideController extends ChangeNotifier {
   /// different price than it started (waiting time, a changed drop-off).
   void completeTrip({int? finalFare}) {
     final trip = _trip;
-    if (trip == null) return;
+    if (trip == null) {
+      // `ride-ended` for a trip this tablet never saw — it was offline when the
+      // ride started, or lost the trip to a restart. There is no fare screen to
+      // show without a trip, but the screen on display is now certainly wrong,
+      // so rebuild it from the backend rather than silently ignoring the event.
+      _log('ended → no local trip to complete, re-syncing');
+      syncActiveRide();
+      return;
+    }
     _generation++;
     if (finalFare != null) _trip = trip.withFare(finalFare);
     _phase = RidePhase.completed;
