@@ -7,13 +7,17 @@ import 'package:provider/provider.dart';
 
 import 'package:cabby_lite/config/layout.dart';
 import 'package:cabby_lite/config/theme.dart';
+import 'package:cabby_lite/core/pairing_service.dart';
+import 'package:cabby_lite/core/payment_service.dart';
 import 'package:cabby_lite/core/ride_service.dart';
 import 'package:cabby_lite/core/ride_socket.dart';
 import 'package:cabby_lite/models/captain.dart';
 import 'package:cabby_lite/models/trip.dart';
 import 'package:cabby_lite/screens/captain_home_shell.dart';
+import 'package:cabby_lite/screens/device_pairing_screen.dart';
 import 'package:cabby_lite/screens/ride_in_progress_screen.dart';
 import 'package:cabby_lite/state/location_service.dart';
+import 'package:cabby_lite/state/pairing_controller.dart';
 import 'package:cabby_lite/state/ride_controller.dart';
 
 /// Stands in for `/captain/active-ride`. These are layout tests — they drive
@@ -27,6 +31,60 @@ class _FakeRideService implements RideService {
 
   @override
   Future<ActiveRide> activeRide() async => active;
+}
+
+/// Stands in for the payment endpoints. Layout tests must not reach the
+/// network — `ApiClient` reads `.env`, which isn't loaded under the test
+/// binding, so a real call throws before it ever gets to a socket.
+class _FakePaymentService implements PaymentService {
+  _FakePaymentService([this.current = const PaymentStatus(amount: 320)]);
+
+  final PaymentStatus current;
+  final List<String> posted = [];
+
+  @override
+  Future<PaymentStatus> status(String rideId) async => current;
+
+  @override
+  Future<PaymentStatus> confirmCash(String rideId) async {
+    posted.add('paid:$rideId');
+    return const PaymentStatus(status: 'paid');
+  }
+
+  @override
+  Future<PaymentStatus> dispute(String rideId, {String? note}) async {
+    posted.add('disputed:$rideId');
+    return const PaymentStatus(status: 'disputed');
+  }
+}
+
+/// Stands in for `/device/pair/*`. Hands back a code immediately so a pairing
+/// layout test renders a real QR instead of the spinner placeholder, with no
+/// network round trip.
+///
+/// [alreadyExpired] backdates `expiresAt`, which drives the controller's
+/// client-side expiry the moment it ticks. That reaches the expired phase — the
+/// taller of the two, since it swaps the countdown for a button — without
+/// advancing fake time past the 2s poll, which would leave a pending periodic
+/// timer and hang the test binding.
+class _FakePairingService implements PairingService {
+  const _FakePairingService({this.alreadyExpired = false});
+
+  final bool alreadyExpired;
+
+  @override
+  Future<PairingCode> start(String deviceId) async => PairingCode(
+        code: 'TEST-CODE-1234',
+        expiresAt: DateTime.now().add(
+          alreadyExpired
+              ? const Duration(seconds: -1)
+              : const Duration(minutes: 2),
+        ),
+      );
+
+  @override
+  Future<PairingStatus> status(String code, String deviceId) async =>
+      const PairingStatus(state: PairingState.pending);
 }
 
 /// Counts calls, to pin down when [RideController.startTrip] re-syncs.
@@ -451,6 +509,88 @@ void main() {
     });
   });
 
+  group('qr payment', () {
+    RideController paired(_FakePaymentService payments) => RideController(
+          rideService: const _FakeRideService(),
+          paymentService: payments,
+          connectSocket: false,
+        )..restorePairing();
+
+    test('the QR encodes exactly cabby-pay:v1:<rideId>', () {
+      // The rider's scanner posts what it decodes straight through, so any
+      // extra field here breaks the parse on their side.
+      final trip = Trip.fromActiveRide(const {'_id': '09bec09e', 'fare': 320});
+      expect('cabby-pay:v1:${trip.id}', 'cabby-pay:v1:09bec09e');
+    });
+
+    test('confirming cash settles the fare as paid', () async {
+      final payments = _FakePaymentService();
+      final ctrl = paired(payments)..startTrip(Trip.sample());
+      expect(ctrl.paymentOutcome, isNull);
+
+      await ctrl.confirmCashPayment();
+
+      expect(payments.posted, ['paid:${Trip.sample().id}']);
+      expect(ctrl.paymentOutcome, PaymentOutcome.paid);
+    });
+
+    test('a dispute settles as disputed and never blocks', () async {
+      final payments = _FakePaymentService();
+      final ctrl = paired(payments)..startTrip(Trip.sample());
+
+      await ctrl.disputePayment();
+
+      expect(payments.posted.single, startsWith('disputed:'));
+      expect(ctrl.paymentOutcome, PaymentOutcome.disputed);
+      // The captain is still free to take the next job.
+      expect(ctrl.isPaired, isTrue);
+    });
+
+    test('a payment event for another ride is ignored', () {
+      final ctrl = paired(_FakePaymentService())..startTrip(Trip.sample());
+
+      ctrl.receivePaymentEvent(PaymentOutcome.paid, 'some-other-ride');
+
+      // Otherwise a late event from the previous trip flashes "Paid" over a
+      // fare this rider still owes.
+      expect(ctrl.paymentOutcome, isNull);
+    });
+
+    test('a payment event for the trip on screen settles it', () {
+      final trip = Trip.sample();
+      final ctrl = paired(_FakePaymentService())..startTrip(trip);
+
+      ctrl.receivePaymentEvent(PaymentOutcome.paid, trip.id);
+
+      expect(ctrl.paymentOutcome, PaymentOutcome.paid);
+    });
+
+    test('the next ride starts with an outstanding fare', () {
+      final trip = Trip.sample();
+      final ctrl = paired(_FakePaymentService())..startTrip(trip);
+      ctrl.receivePaymentEvent(PaymentOutcome.paid, trip.id);
+      expect(ctrl.paymentOutcome, PaymentOutcome.paid);
+
+      ctrl.clearTrip();
+      ctrl.startTrip(trip);
+
+      // A carried-over outcome would show the new fare as already settled.
+      expect(ctrl.paymentOutcome, isNull);
+    });
+
+    test('the authoritative amount replaces the fare from ride-ended',
+        () async {
+      final ctrl = paired(
+        _FakePaymentService(const PaymentStatus(amount: 349, status: 'unpaid')),
+      )..startTrip(Trip.sample());
+
+      await ctrl.loadPaymentStatus();
+
+      expect(ctrl.paymentStatus?.amount, 349);
+      expect(ctrl.paymentOutcome, isNull);
+    });
+  });
+
   testWidgets('sign out unpairs and wipes the device token', (tester) async {
     secureStore['cabby_device_token'] = 'eyJ-device-token';
     final ctrl = RideController(rideService: const _FakeRideService(), connectSocket: false)..restorePairing();
@@ -524,7 +664,13 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    final ctrl = RideController(rideService: const _FakeRideService(), connectSocket: false);
+    final ctrl = RideController(
+      rideService: const _FakeRideService(),
+      // The summary screen fetches the authoritative amount on mount; without
+      // a fake that reaches the real ApiClient, which reads an unloaded .env.
+      paymentService: _FakePaymentService(),
+      connectSocket: false,
+    );
     setup(ctrl);
 
     await tester.pumpWidget(
@@ -554,6 +700,12 @@ void main() {
     'tablet portrait (Tab A7)': Size(800, 1340),
     'tablet landscape (Tab A7)': Size(1340, 800),
     'large tablet landscape': Size(1280, 900),
+    // The actual deployment: a windscreen-mounted tablet, landscape-locked.
+    'windscreen tablet': Size(1180, 820),
+    // A budget 800x480 Android tablet — the shortest viewport that still counts
+    // as a real target, and the one where a too-optimistic fits-on-screen
+    // estimate showed up as a 1px overflow stripe.
+    'budget tablet': Size(800, 480),
   };
 
   sizes.forEach((label, size) {
@@ -626,6 +778,56 @@ void main() {
       expect(find.text('2.4 km'), findsOneWidget);
     });
 
+    // The pre-drive panel is the taller of the two — rider row, fare, and a
+    // full RouteCard — so it is the one with something to overflow. Same
+    // wrapper as the driving panel above.
+    testWidgets('trip panel lays out without overflow — $label',
+        (tester) async {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.light,
+          home: Builder(
+            builder: (context) {
+              final layout = context.layout;
+              return Scaffold(
+                body: Stack(
+                  children: [
+                    Align(
+                      alignment: layout.isTablet
+                          ? Alignment.bottomLeft
+                          : Alignment.bottomCenter,
+                      child: Padding(
+                        padding: EdgeInsets.all(layout.isTablet ? 16 : 0),
+                        child: SizedBox(
+                          width: layout.isTablet ? 460.0 : layout.width,
+                          child: AnimatedSize(
+                            duration: const Duration(milliseconds: 300),
+                            alignment: Alignment.bottomCenter,
+                            child: TripPanel(
+                              trip: Trip.sample(),
+                              floating: layout.isTablet,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(tester.takeException(), isNull);
+    });
+
     testWidgets('ride summary lays out without overflow — $label',
         (tester) async {
       await pumpAt(tester, size, (c) {
@@ -636,5 +838,67 @@ void main() {
       expect(tester.takeException(), isNull);
       expect(find.text('Ride completed'), findsOneWidget);
     });
+
+    // Pairing is the one screen with a fixed-size QR and, until recently, no
+    // scrollable — a short viewport had nowhere to put the overflow. Both
+    // phases are covered: expired swaps the countdown for a taller button, so
+    // it is the tighter of the two.
+    for (final expired in const [false, true]) {
+      final phaseName = expired ? 'expired' : 'live code';
+      testWidgets('device pairing ($phaseName) lays out without overflow — '
+          '$label', (tester) async {
+        tester.view.physicalSize = size;
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        final pairing = PairingController(
+          service: _FakePairingService(alreadyExpired: expired),
+        );
+        addTearDown(pairing.dispose);
+
+        await tester.pumpWidget(
+          ChangeNotifierProvider.value(
+            value: pairing,
+            child: const MaterialApp(home: DevicePairingScreen()),
+          ),
+        );
+        // Two frames: one for the post-frame start(), one for what it sets to
+        // paint. Deliberately short of the 2s poll — advancing past it leaves
+        // the periodic timer pending and the binding never settles. The QR card
+        // is laid out at its full size from frame one either way (the code
+        // arrives later and swaps a spinner for the QR *inside* the card), and
+        // layout is all these assert on.
+        await tester.pump();
+        await tester.pump();
+
+        expect(tester.takeException(), isNull);
+
+        // The card must sit in the middle of the screen, not just fit on it.
+        // A scroll view hands its child a loose width, so without an explicit
+        // full-width floor the Column shrank to its widest child and parked the
+        // whole thing ~300px left of centre on a wide tablet — no overflow, so
+        // the check above sailed straight past it.
+        // The QR card is the only large square on the screen. The bound is well
+        // under the 200 floor it shrinks to on a short viewport — at 200 exactly
+        // a `> 200` test finds nothing and fails on the finder, not the layout.
+        Rect? qr;
+        for (final e in find.byType(DecoratedBox).evaluate()) {
+          final r = tester.getRect(
+            find.byElementPredicate((x) => identical(x, e)),
+          );
+          if (r.width >= 150 && (r.width - r.height).abs() < 1.0) {
+            qr = r;
+            break;
+          }
+        }
+        expect(qr, isNotNull, reason: 'no square QR card found');
+        expect(
+          qr!.center.dx,
+          closeTo(size.width / 2, 1.0),
+          reason: 'QR card not horizontally centred at $label',
+        );
+      });
+    }
   });
 }

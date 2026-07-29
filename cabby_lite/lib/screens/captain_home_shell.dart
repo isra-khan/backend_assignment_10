@@ -38,7 +38,11 @@ class _CaptainHomeShellState extends State<CaptainHomeShell> {
     final token = await DeviceTokenStore.token();
     if (!mounted) return;
     if (token != null && token.isNotEmpty) {
-      context.read<RideController>().restorePairing();
+      // Awaited so the spinner covers the stored-profile read too — otherwise
+      // the welcome screen paints one frame greeting a generic "Captain"
+      // before the real name lands.
+      await context.read<RideController>().restorePairing();
+      if (!mounted) return;
     }
     setState(() => _restored = true);
   }

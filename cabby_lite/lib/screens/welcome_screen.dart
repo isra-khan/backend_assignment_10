@@ -36,8 +36,11 @@ class WelcomeScreen extends StatelessWidget {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(
                     maxWidth: twoColumn ? 920 : layout.contentMaxWidth,
+                    // Clamped: a viewport shorter than the page padding itself
+                    // would make this negative, and BoxConstraints asserts.
                     minHeight:
-                        constraints.maxHeight - layout.pagePadding.vertical,
+                        (constraints.maxHeight - layout.pagePadding.vertical)
+                            .clamp(0.0, double.infinity),
                   ),
                   // IntrinsicHeight gives the Column a bounded height even
                   // inside the (vertically unbounded) scroll view, so the
@@ -47,18 +50,11 @@ class WelcomeScreen extends StatelessWidget {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // Top bar: logo + sign out.
-                        Row(
-                          children: [
-                            BrandLogo(height: layout.scale(28)),
-                            const Spacer(),
-                            IconButton(
-                              tooltip: 'Sign out',
-                              onPressed: () => ctrl.signOut(),
-                              icon: Icon(Icons.logout, color: tone.muted),
-                            ),
-                          ],
-                        ),
+                        // Top bar. No sign-out here: the tablet is paired to the
+                        // vehicle for the life of its device token, not signed
+                        // in per shift, so there is nothing for a captain to
+                        // sign out of.
+                        BrandLogo(height: layout.scale(28)),
                         SizedBox(height: layout.scale(8)),
                         const StatusPill(online: true),
                         SizedBox(height: layout.scale(28)),

@@ -58,30 +58,99 @@ class _DevicePairingScreenState extends State<DevicePairingScreen> {
     return Scaffold(
       backgroundColor: Palette.zinc950,
       body: SafeArea(
-        child: Padding(
-          padding: EdgeInsets.all(layout.scale(24)),
-          child: Column(
-            children: [
-              BrandLogo(height: layout.scale(34), color: Colors.white),
-              const Spacer(),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 520),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _accessPill(context),
-                    SizedBox(height: layout.scale(24)),
-                    _QrCard(controller: ctrl),
-                    SizedBox(height: layout.scale(24)),
-                    _copy(context, ctrl),
-                    SizedBox(height: layout.scale(16)),
-                    _footer(context, ctrl),
-                  ],
-                ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // Everything on the card except the QR itself: the logo, the pill,
+            // both blocks of copy, the footer, and the gaps between them.
+            //
+            // These are estimates — the copy wraps and the footer swaps a
+            // countdown for a button — so a slack allowance covers the error.
+            // Without it the estimate lands a hair under the truth, `fits` says
+            // yes, and IntrinsicHeight then forces a height the viewport can't
+            // take: a 1px overflow on an 800x480 tablet, which is a stripe
+            // across the screen rather than a rounding detail.
+            const slack = 24.0;
+            final chrome =
+                layout.scale(34 + 29 + 75 + 17 + 14 + 14 + 10) + slack;
+            final qrSide = _qrSide(
+              layout,
+              room: (constraints.maxHeight - layout.scale(24) * 2 - chrome)
+                  .clamp(0.0, double.infinity),
+            );
+
+            final card = ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 520),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _accessPill(context),
+                  SizedBox(height: layout.scale(14)),
+                  _QrCard(controller: ctrl, side: qrSide),
+                  SizedBox(height: layout.scale(14)),
+                  _copy(context, ctrl),
+                  SizedBox(height: layout.scale(10)),
+                  _footer(context, ctrl),
+                ],
               ),
-              const Spacer(),
-            ],
-          ),
+            );
+            final logo = BrandLogo(
+              height: layout.scale(34),
+              color: Colors.white,
+            );
+            final pad = layout.scale(24) * 2;
+            final available =
+                (constraints.maxHeight - pad).clamp(0.0, double.infinity);
+            final fullWidth =
+                (constraints.maxWidth - pad).clamp(0.0, double.infinity);
+
+            // The QR has already been shrunk to whatever height was going, so
+            // if the total still doesn't fit, nothing further will make it —
+            // the screen scrolls rather than shrink the code past scanning.
+            final fits = chrome + qrSide <= available;
+
+            // Two modes, and the difference matters. When there is room, the
+            // Spacers centre the card — but a Spacer needs a bounded height,
+            // which a scroll view won't give, hence IntrinsicHeight. When there
+            // isn't room, that same forced height is what overflows: the scroll
+            // view is willing to scroll and IntrinsicHeight won't let it. So a
+            // short screen drops both and just scrolls.
+            final body = fits
+                ? IntrinsicHeight(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        logo,
+                        const Spacer(),
+                        card,
+                        const Spacer(),
+                      ],
+                    ),
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      logo,
+                      SizedBox(height: layout.scale(24)),
+                      card,
+                    ],
+                  );
+
+            return SingleChildScrollView(
+              padding: EdgeInsets.all(layout.scale(24)),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: fits ? available : 0.0,
+                  // Full viewport width, so the Column has something to centre
+                  // within. A scroll view hands its child a LOOSE width, and a
+                  // Column under a loose constraint shrinks to its widest child
+                  // — which left the whole card sitting off-centre on a wide
+                  // tablet no matter what crossAxisAlignment said.
+                  minWidth: fullWidth,
+                ),
+                child: body,
+              ),
+            );
+          },
         ),
       ),
     );
@@ -107,12 +176,19 @@ class _DevicePairingScreenState extends State<DevicePairingScreen> {
             color: Palette.brandAccent,
           ),
           SizedBox(width: layout.scale(6)),
-          Text(
-            'Government of Sindh · Captain access',
-            style: TextStyle(
-              color: Palette.brandAccent,
-              fontSize: layout.scale(12),
-              fontWeight: FontWeight.w600,
+          // Flexible so the label can give: the Row is mainAxisSize.min inside
+          // a 520-wide cap, and at tablet scale this string plus the icon and
+          // padding runs past it. Unwrapped it had no way to shrink and simply
+          // overflowed to the right.
+          Flexible(
+            child: Text(
+              'Government of Sindh · Captain access',
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Palette.brandAccent,
+                fontSize: layout.scale(12),
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
         ],
@@ -231,22 +307,38 @@ class _DevicePairingScreenState extends State<DevicePairingScreen> {
   }
 }
 
+/// Side length of the square QR card.
+///
+/// Big enough to scan from the driver's seat, capped so it doesn't dominate a
+/// large landscape panel, and — when [room] says the screen is short on height
+/// — allowed to give some of that back so the card fits without scrolling.
+///
+/// The 200 floor is where it stops giving: below roughly that a QR can't be
+/// read from the driver's seat, which is the screen's whole job, so a very
+/// short viewport scrolls rather than rendering something unscannable. On a
+/// tablet there is always room to spare and [room] never binds.
+double _qrSide(AppLayout layout, {double room = double.infinity}) {
+  final preferred = (layout.shortestSide * 0.42).clamp(280.0, 460.0);
+  if (room >= preferred) return preferred;
+  return room.clamp(200.0, preferred);
+}
+
 /// The QR itself, on a white card.
 ///
 /// The white ground is functional, not decorative: a QR drawn on the app's dark
 /// background is a contrast inversion that many scanners refuse, and the quiet
 /// zone around it is part of the spec.
 class _QrCard extends StatelessWidget {
-  const _QrCard({required this.controller});
+  const _QrCard({required this.controller, required this.side});
 
   final PairingController controller;
+
+  /// Measured by the screen, which knows how much height is left over.
+  final double side;
 
   @override
   Widget build(BuildContext context) {
     final layout = context.layout;
-    // Big enough to scan from the driver's seat, capped so it doesn't dominate
-    // a large landscape panel.
-    final side = (layout.shortestSide * 0.42).clamp(280.0, 460.0);
     final code = controller.code;
     final expired = controller.phase == PairingPhase.expired;
 

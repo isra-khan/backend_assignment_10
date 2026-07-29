@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -5,14 +7,61 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../config/layout.dart';
 import '../config/palette.dart';
 import '../config/tone.dart';
+import '../core/payment_service.dart' show PaymentOutcome;
 import '../models/trip.dart';
 import '../state/ride_controller.dart';
+import '../widgets/round_button.dart' show ButtonSpinner;
 import '../widgets/route_card.dart';
 
 /// Shown after a trip ends. Presents the fare, the trip details, and a QR the
 /// rider scans to pay — then returns the captain to standby.
-class RideSummaryScreen extends StatelessWidget {
+class RideSummaryScreen extends StatefulWidget {
   const RideSummaryScreen({super.key});
+
+  @override
+  State<RideSummaryScreen> createState() => _RideSummaryScreenState();
+}
+
+class _RideSummaryScreenState extends State<RideSummaryScreen> {
+  /// How long "Paid" stays up before the tablet returns itself to standby —
+  /// long enough for the captain to register it, short enough that the next
+  /// rider doesn't get in to a stale fare screen.
+  static const _settledLinger = Duration(seconds: 3);
+
+  Timer? _returnTimer;
+  RideController? _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    // Ask for the authoritative amount. Deferred a frame so the first paint —
+    // and the QR the rider is waiting to scan — isn't held up by a network
+    // call.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) context.read<RideController>().loadPaymentStatus();
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _controller = context.read<RideController>();
+  }
+
+  @override
+  void dispose() {
+    _returnTimer?.cancel();
+    super.dispose();
+  }
+
+  /// Once the fare is settled either way, hand the tablet back to standby on
+  /// its own — nobody is going to tap a button in the back of a car.
+  void _scheduleReturn() {
+    if (_returnTimer != null) return;
+    _returnTimer = Timer(_settledLinger, () {
+      if (mounted) _controller?.clearTrip();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -21,6 +70,9 @@ class RideSummaryScreen extends StatelessWidget {
     final ctrl = context.watch<RideController>();
     final trip = ctrl.trip;
     if (trip == null) return const SizedBox.shrink();
+
+    final outcome = ctrl.paymentOutcome;
+    if (outcome != null) _scheduleReturn();
 
     // On a wide tablet the payment QR sits beside the fare + route rather than
     // scrolling below them, so it's visible without scrolling for the rider.
@@ -56,20 +108,30 @@ class RideSummaryScreen extends StatelessWidget {
       ],
     );
 
-    final actions = Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        FilledButton(
-          onPressed: () => ctrl.clearTrip(),
-          child: const Text('Payment received · Back to standby'),
-        ),
-        SizedBox(height: layout.scale(8)),
-        TextButton(
-          onPressed: () => ctrl.clearTrip(),
-          child: Text('Skip', style: TextStyle(color: tone.muted)),
-        ),
-      ],
-    );
+    // Settled fares need no buttons — the tablet returns itself to standby.
+    final busy = ctrl.isSettlingPayment;
+    final actions = outcome != null
+        ? const SizedBox.shrink()
+        : Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              FilledButton(
+                onPressed: busy ? null : () => ctrl.confirmCashPayment(),
+                child: busy
+                    ? const ButtonSpinner()
+                    : const Text('Cash received'),
+              ),
+              SizedBox(height: layout.scale(8)),
+              TextButton(
+                // Flags the ride for support. Deliberately never blocks the
+                // captain — they still return to standby and can take the
+                // next job.
+                onPressed: busy ? null : () => ctrl.disputePayment(),
+                child: Text('Rider did not pay',
+                    style: TextStyle(color: tone.muted)),
+              ),
+            ],
+          );
 
     return Scaffold(
       body: SafeArea(
@@ -105,13 +167,15 @@ class RideSummaryScreen extends StatelessWidget {
                           ),
                         ),
                         SizedBox(width: layout.gap),
-                        Expanded(child: _PaymentQrCard(trip: trip)),
+                        Expanded(
+                          child: _PaymentQrCard(
+                              trip: trip, outcome: outcome)),
                       ],
                     )
                   else ...[
                     _FareCard(trip: trip),
                     SizedBox(height: layout.gap),
-                    _PaymentQrCard(trip: trip),
+                    _PaymentQrCard(trip: trip, outcome: outcome),
                     SizedBox(height: layout.gap),
                     RouteCard(
                         pickup: trip.pickup, destination: trip.destination),
@@ -247,16 +311,25 @@ class _FareCard extends StatelessWidget {
 
 /// The scannable payment QR the rider uses to settle the fare.
 class _PaymentQrCard extends StatelessWidget {
-  const _PaymentQrCard({required this.trip});
+  const _PaymentQrCard({required this.trip, this.outcome});
   final Trip trip;
+
+  /// Set once the fare is settled — the QR is replaced by the result, so a
+  /// paid ride can't be scanned and charged twice.
+  final PaymentOutcome? outcome;
 
   @override
   Widget build(BuildContext context) {
     final tone = context.tone;
     final layout = context.layout;
-    // Payment intent the rider's app resolves. Kept simple and self-describing.
-    final payload =
-        'cabby-pay:trip=${trip.id};amount=${trip.fare};currency=PKR';
+
+    final settled = outcome;
+    if (settled != null) return _SettledCard(outcome: settled);
+
+    // Exactly `cabby-pay:v1:<rideId>` — nothing else. The rider's app pulls the
+    // id out and asks the backend for the amount itself via
+    // `GET /ride/:id/payment`, so anything extra in here only breaks the parse.
+    final payload = 'cabby-pay:v1:${trip.id}';
     // Larger, easier-to-scan QR on tablets. LayoutBuilder below clamps it to
     // the card's width so it never overflows a narrow two-column layout.
     final preferredQr = layout.isTablet ? 260.0 : 200.0;
@@ -330,6 +403,65 @@ class _PaymentQrCard extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Replaces the QR once the fare is settled. Deliberately large and plain —
+/// the captain reads it at a glance from the driver's seat, and the screen
+/// returns itself to standby a few seconds later.
+class _SettledCard extends StatelessWidget {
+  const _SettledCard({required this.outcome});
+  final PaymentOutcome outcome;
+
+  @override
+  Widget build(BuildContext context) {
+    final tone = context.tone;
+    final layout = context.layout;
+    final paid = outcome == PaymentOutcome.paid;
+    final accent = paid ? tone.brand : Palette.danger;
+
+    return Container(
+      padding: EdgeInsets.all(layout.scale(28)),
+      decoration: BoxDecoration(
+        color: tone.fill,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: layout.scale(72),
+            height: layout.scale(72),
+            decoration: BoxDecoration(
+              color: accent.withValues(alpha: 0.12),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(
+              paid ? Icons.check_rounded : Icons.report_gmailerrorred_outlined,
+              color: accent,
+              size: layout.scale(40),
+            ),
+          ),
+          SizedBox(height: layout.scale(16)),
+          Text(
+            paid ? 'Paid' : 'Marked unpaid',
+            style: TextStyle(
+              fontSize: layout.scale(24),
+              fontWeight: FontWeight.w800,
+              color: accent,
+            ),
+          ),
+          SizedBox(height: layout.scale(6)),
+          Text(
+            paid
+                ? 'Returning to standby…'
+                : 'Flagged for support · returning to standby…',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: layout.scale(13), color: tone.muted),
           ),
         ],
       ),

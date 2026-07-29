@@ -49,6 +49,13 @@ class RideInProgressScreen extends StatefulWidget {
 }
 
 class _RideInProgressScreenState extends State<RideInProgressScreen> {
+  /// Width of the floating trip/nav card on a tablet.
+  ///
+  /// Shared by the panel itself and by the camera padding that has to steer the
+  /// route clear of it — as two separate literals they drifted apart silently,
+  /// and the map has no way to tell you the route is hidden behind a card.
+  static const double _panelWidth = 460;
+
   mb.MapboxMap? _map;
   mb.PointAnnotationManager? _points;
   mb.PolylineAnnotationManager? _lines;
@@ -93,6 +100,13 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   /// Null until the first fix lands.
   double? _remainingMetres;
 
+  /// Layout tokens captured from the last build.
+  ///
+  /// The camera helpers are async and run well after their frame, so an
+  /// ancestor lookup there can hit a defunct element. Reading the tokens during
+  /// build and holding them is the same trick [_controller] uses.
+  AppLayout? _layout;
+
   bool get _driving => _mode == MapMode.driving;
 
   /// Camera zoom/pitch for the current mode. Driving pulls in close and tilts
@@ -130,6 +144,41 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
   mb.Point _pt(GeoPoint g) =>
       mb.Point(coordinates: mb.Position(g.longitude, g.latitude));
 
+  /// Camera padding that matches where the chrome actually sits.
+  ///
+  /// The previous constants (top 120, bottom 320) were tuned for a portrait
+  /// phone, where the trip panel was a full-bleed sheet across the bottom of a
+  /// tall screen. Landscape changed the geometry underneath them: on a tablet
+  /// the panel is a floating [_panelWidth]-wide card at bottomLeft, so it
+  /// covers the LEFT of the map for its own height, not a band across the whole
+  /// bottom. Reserving 320px down there pushed the route up into the top third
+  /// of a screen whose bottom two-thirds were clear map.
+  ///
+  /// Every inset is capped so the box Mapbox fits into stays comfortably
+  /// positive — it frames the route inside `viewport - padding`, and an inset
+  /// that swallows its axis leaves nothing to fit and yields a useless camera.
+  /// Height is the scarce axis in landscape, so it gets the tighter third;
+  /// width can afford the panel's full column and caps at half.
+  mb.MbxEdgeInsets _mapPadding() {
+    final layout = _layout;
+    if (layout == null) {
+      return mb.MbxEdgeInsets(top: 0, left: 0, bottom: 0, right: 0);
+    }
+
+    double capV(double v) => v.clamp(0.0, layout.height / 3);
+    double capH(double v) => v.clamp(0.0, layout.width / 2);
+
+    return mb.MbxEdgeInsets(
+      // Clears the chrome row and the nav banner sitting under it.
+      top: capV(layout.scale(112)),
+      // On a tablet the panel is beside the map rather than under it, so the
+      // route has to clear its column instead of its height.
+      left: capH(layout.isTablet ? _panelWidth + 32 : layout.scale(24)),
+      bottom: capV(layout.scale(96)),
+      right: capH(layout.scale(24)),
+    );
+  }
+
   /// Frame both the pickup and drop-off (plus the car if we have it) in view.
   /// In driving mode "recenter" means something different — snap back to the
   /// car rather than zooming out to the whole route — so this defers to
@@ -156,7 +205,7 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     final camera = await map.cameraForCoordinatesPadding(
       pts,
       mb.CameraOptions(bearing: 0, pitch: 0),
-      mb.MbxEdgeInsets(top: 120, left: 48, bottom: 320, right: 48),
+      _mapPadding(),
       null,
       null,
     );
@@ -178,8 +227,17 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
       zoom: _modeZoom,
       pitch: _modePitch,
       bearing: _driving ? _bearing : 0,
+      // Park the car low in frame so the screen shows the road ahead. A
+      // fraction rather than a constant: the old 260 was about a third of a
+      // portrait phone's height but two thirds of a landscape one, which drove
+      // the car off the bottom edge instead of just lowering it.
       padding: _driving
-          ? mb.MbxEdgeInsets(top: 260, left: 0, bottom: 0, right: 0)
+          ? mb.MbxEdgeInsets(
+              top: (_layout?.height ?? 0) * 0.35,
+              left: 0,
+              bottom: 0,
+              right: 0,
+            )
           : mb.MbxEdgeInsets(top: 0, left: 0, bottom: 0, right: 0),
     );
 
@@ -430,7 +488,8 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
       _carAnnotation = await mgr.create(mb.PointAnnotationOptions(
         geometry: _pt(at),
         image: bytes.buffer.asUint8List(),
-        iconSize: 0.7,
+        // The source PNG is 256×118, so this renders ~102×47 logical px.
+        iconSize: 0.4,
       ));
     } else {
       _carAnnotation!.geometry = _pt(at);
@@ -530,13 +589,16 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
     if (trip == null) return const SizedBox.shrink();
     final tone = context.tone;
     final layout = context.layout;
+    // Held for the async camera helpers, which run after this frame and can't
+    // safely look the tokens up themselves.
+    _layout = layout;
     // On a tablet the trip panel and nav banner float as cards with a capped
     // width instead of spanning the whole screen; on a phone they stay full-
     // bleed as before. Phones resolve to the real screen width rather than
     // double.infinity — the panels sit inside an AnimatedSize, which sizes to
     // its child and would otherwise hand a `width: double.infinity` panel an
     // unbounded constraint.
-    final panelMaxWidth = layout.isTablet ? 460.0 : layout.width;
+    final panelMaxWidth = layout.isTablet ? _panelWidth : layout.width;
 
     return Scaffold(
       body: Stack(
@@ -557,7 +619,7 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
           // pill is noise while driving, so it drops out of the row there.
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.all(12),
+              padding: EdgeInsets.all(layout.scale(12)),
               child: Row(
                 children: [
                   RoundButton(
@@ -586,7 +648,16 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
             right: 0,
             child: SafeArea(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 60, 12, 0),
+                // Clears the chrome row above: a RoundButton (scale(10) padding
+                // either side of a scale(20) icon) inside scale(12) padding.
+                // Derived rather than a flat 60 — that was the height of
+                // portrait phone chrome and left a gap once type scaled up.
+                padding: EdgeInsets.fromLTRB(
+                  layout.scale(12),
+                  layout.scale(12) * 2 + layout.scale(40),
+                  layout.scale(12),
+                  0,
+                ),
                 child: Align(
                   alignment: layout.isTablet
                       ? Alignment.topLeft
@@ -633,7 +704,7 @@ class _RideInProgressScreenState extends State<RideInProgressScreen> {
                           floating: layout.isTablet,
                           remainingMetres: _remainingMetres,
                         )
-                      : _TripPanel(
+                      : TripPanel(
                           trip: trip,
                           floating: layout.isTablet,
                         ),
@@ -874,8 +945,14 @@ class DrivingPanel extends StatelessWidget {
   }
 }
 
-class _TripPanel extends StatelessWidget {
-  const _TripPanel({
+/// The pre-drive panel: rider, fare, and the route's two ends.
+///
+/// Public only so the layout tests can render it without a Mapbox platform
+/// view; nothing outside this file should build it directly.
+@visibleForTesting
+class TripPanel extends StatelessWidget {
+  const TripPanel({
+    super.key,
     required this.trip,
     this.floating = false,
   });
@@ -910,20 +987,30 @@ class _TripPanel extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Trip meta chips.
+              // Trip meta chips, then the fare hard right.
+              //
+              // The fare is Flexible, not the chips: at tablet scale a
+              // four-figure "PKR 1100" at scale(20)/w800 is the widest thing in
+              // the row by some margin, and it was pushing the chips off the
+              // 460 card. It ellipsizes rather than overflow, while the chips
+              // keep their (short, fixed) labels intact.
               Row(
                 children: [
                   _chip(tone, layout, Icons.route,
                       '${trip.km.toStringAsFixed(1)} km'),
                   SizedBox(width: layout.scale(8)),
                   _chip(tone, layout, Icons.schedule, '${trip.minutes} min'),
-                  const Spacer(),
-                  Text(
-                    'PKR ${trip.fare}',
-                    style: TextStyle(
-                      fontSize: layout.scale(20),
-                      fontWeight: FontWeight.w800,
-                      color: tone.brand,
+                  SizedBox(width: layout.scale(8)),
+                  Expanded(
+                    child: Text(
+                      'PKR ${trip.fare}',
+                      textAlign: TextAlign.right,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: layout.scale(20),
+                        fontWeight: FontWeight.w800,
+                        color: tone.brand,
+                      ),
                     ),
                   ),
                 ],

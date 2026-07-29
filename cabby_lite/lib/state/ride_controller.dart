@@ -1,6 +1,8 @@
 import 'package:flutter/foundation.dart';
 
+import '../core/captain_store.dart';
 import '../core/device_token_store.dart';
+import '../core/payment_service.dart';
 import '../core/ride_service.dart';
 import '../core/ride_socket.dart';
 import '../models/captain.dart';
@@ -19,10 +21,15 @@ enum RidePhase { welcome, inProgress, completed }
 class RideController extends ChangeNotifier {
   /// [connectSocket] is false in tests, which drive the phase directly and must
   /// not open a real connection.
-  RideController({RideService? rideService, this.connectSocket = true})
-      : _rides = rideService ?? const RideService();
+  RideController({
+    RideService? rideService,
+    PaymentService? paymentService,
+    this.connectSocket = true,
+  })  : _rides = rideService ?? const RideService(),
+        _payments = paymentService ?? const PaymentService();
 
   final RideService _rides;
+  final PaymentService _payments;
 
   /// Whether this controller opens the live ride feed.
   final bool connectSocket;
@@ -43,6 +50,19 @@ class RideController extends ChangeNotifier {
   bool _syncing = false;
   bool _disposed = false;
 
+  /// How the current trip's fare was settled. Null while it is still
+  /// outstanding — which is every trip until the rider pays or the captain
+  /// records the outcome.
+  PaymentOutcome? _paymentOutcome;
+
+  /// The authoritative amount from `GET /ride/:id/payment`, once fetched. Null
+  /// until then; the summary screen falls back to the fare it already has.
+  PaymentStatus? _paymentStatus;
+
+  /// True while a confirm/dispute POST is in flight, so the buttons can disable
+  /// rather than firing twice.
+  bool _settling = false;
+
   /// When the tracker last reported a position. Null in a GPS vehicle, or
   /// before the first `my-location` arrives.
   DateTime? _lastTrackerFixAt;
@@ -55,6 +75,15 @@ class RideController extends ChangeNotifier {
   Captain? get captain => _captain;
   RidePhase get phase => _phase;
   Trip? get trip => _trip;
+
+  /// How the current fare was settled, or null while it is outstanding.
+  PaymentOutcome? get paymentOutcome => _paymentOutcome;
+
+  /// The backend's own view of the fare, once fetched.
+  PaymentStatus? get paymentStatus => _paymentStatus;
+
+  /// True while a confirm/dispute call is in flight.
+  bool get isSettlingPayment => _settling;
 
   /// Where to draw the car before any live fix arrives, from the last
   /// `/captain/active-ride`. Null when the backend didn't report one.
@@ -111,8 +140,8 @@ class RideController extends ChangeNotifier {
   /// pairing screen and the ride faces.
   ///
   /// Note this is not the same as "we know who the captain is": a tablet
-  /// restored from a stored token is paired but has no profile until the first
-  /// /captain/active-ride lands, so [captain] can be null here.
+  /// restored from a stored token is paired before [CaptainStore] has answered,
+  /// so [captain] can briefly be null here.
   bool get isPaired => _paired;
 
   /// Restore a previous pairing on boot, from the token in the keystore.
@@ -120,10 +149,16 @@ class RideController extends ChangeNotifier {
   /// Marks the tablet paired immediately so the QR screen never flashes at an
   /// already-linked device, then rebuilds the real screen from the backend and
   /// opens the live feed.
-  void restorePairing() {
+  ///
+  /// Awaits the stored profile — and only that. The caller holds its boot
+  /// spinner until this returns, so a local disk read is fine to wait on but
+  /// the network calls below must stay fire-and-forget, or the spinner lives as
+  /// long as `/captain/active-ride` takes.
+  Future<void> restorePairing() async {
     _paired = true;
     _phase = RidePhase.welcome;
     notifyListeners();
+    await _restoreCaptain();
     syncActiveRide();
     _openSocket();
   }
@@ -131,16 +166,32 @@ class RideController extends ChangeNotifier {
   /// Adopt the captain this tablet just paired to. [captain] comes from the
   /// `linked` pairing response, so it is the real account, not a local guess.
   void signInFromPairing(Captain? captain) {
-    _captain = captain ?? const Captain(name: 'Captain');
+    final adopted = captain ?? const Captain(name: 'Captain');
+    _captain = adopted;
     _paired = true;
     _phase = RidePhase.welcome;
     _trip = null;
     notifyListeners();
+    // The pairing response is the only place the backend ever sends the
+    // captain, so persist it here or the name is gone on the next launch.
+    CaptainStore.save(adopted);
     // A captain can pair mid-ride — a tablet swapped into a moving car, or one
     // that was unlinked and re-linked. Don't assume the fresh pairing means an
     // idle vehicle.
     syncActiveRide();
     _openSocket();
+  }
+
+  /// Bring back the stored profile after a restart.
+  ///
+  /// Guarded on `_captain != null` so a fresh pairing that landed while this
+  /// was in flight wins — it is the newer answer, and the stored one may belong
+  /// to the captain who just unlinked.
+  Future<void> _restoreCaptain() async {
+    final stored = await CaptainStore.load();
+    if (_disposed || stored == null || !_paired || _captain != null) return;
+    _captain = stored;
+    notifyListeners();
   }
 
   /// Open the live ride feed, if this controller runs one and isn't already
@@ -151,6 +202,7 @@ class RideController extends ChangeNotifier {
     _socket = RideSocket(
       onEvent: _onRideEvent,
       onLocation: _onTrackerFix,
+      onPayment: _onPaymentEvent,
       // The guide is explicit: after a reconnect, re-fetch rather than assume
       // the screen is still right. Everything that happened while the socket
       // was down was missed outright.
@@ -269,6 +321,97 @@ class RideController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Feed a payment event as if it arrived over the socket. Tests run with
+  /// `connectSocket: false`, so there is no other way to reach it.
+  @visibleForTesting
+  void receivePaymentEvent(PaymentOutcome outcome, String? rideId) =>
+      _onPaymentEvent(outcome, rideId);
+
+  /// A `payment-received` / `payment-disputed` push.
+  ///
+  /// [rideId] is dropped unless it matches the trip on screen: a late event
+  /// from the previous ride would otherwise flash "Paid" over a fare the rider
+  /// still owes. A null id means the payload carried none, which the guide
+  /// doesn't promise either way — applied to the current trip, since that is
+  /// the only ride this tablet could mean.
+  void _onPaymentEvent(PaymentOutcome outcome, String? rideId) {
+    if (_disposed || !_paired) return;
+    final trip = _trip;
+    if (trip == null) {
+      _log('${outcome.name} ignored — no trip on screen');
+      return;
+    }
+    if (rideId != null && rideId != trip.id) {
+      _log('${outcome.name} ignored — for ride $rideId, showing ${trip.id}');
+      return;
+    }
+    _log('${outcome.name} → settling ${trip.id}');
+    _paymentOutcome = outcome;
+    notifyListeners();
+  }
+
+  /// Fetch the authoritative amount for the fare on screen. Quiet on failure —
+  /// the summary already shows the fare from `ride-ended`, so a network blip
+  /// costs a refinement rather than the screen.
+  Future<void> loadPaymentStatus() async {
+    final trip = _trip;
+    if (trip == null || _disposed) return;
+    try {
+      final status = await _payments.status(trip.id);
+      // The trip can end (or another begin) while this is in flight.
+      if (_disposed || _trip?.id != trip.id) return;
+      _paymentStatus = status;
+      // The rider may have paid before this call landed.
+      _paymentOutcome ??= status.outcome;
+      notifyListeners();
+    } on DeviceRevokedException {
+      await signOut();
+    } on RideException {
+      // Keep the fare we already have.
+    }
+  }
+
+  /// The captain took cash. Records it, and adopts the HTTP answer as the
+  /// truth — the guide is explicit that the response beats the socket event.
+  Future<void> confirmCashPayment() =>
+      _settle((id) => _payments.confirmCash(id), PaymentOutcome.paid);
+
+  /// The rider didn't pay. Flags the ride for support; never blocks the
+  /// captain from carrying on.
+  Future<void> disputePayment({String? note}) =>
+      _settle((id) => _payments.dispute(id, note: note),
+          PaymentOutcome.disputed);
+
+  Future<void> _settle(
+    Future<PaymentStatus> Function(String rideId) call,
+    PaymentOutcome fallback,
+  ) async {
+    final trip = _trip;
+    if (trip == null || _settling || _disposed) return;
+    _settling = true;
+    notifyListeners();
+    try {
+      final status = await call(trip.id);
+      if (_disposed || _trip?.id != trip.id) return;
+      _paymentStatus = status;
+      _paymentOutcome = status.outcome ?? fallback;
+      _log('${_paymentOutcome!.name} recorded for ${trip.id}');
+    } on DeviceRevokedException {
+      await signOut();
+      return;
+    } on RideException catch (e) {
+      // Offline at the kerb is normal. Leave the fare outstanding rather than
+      // claiming an outcome the backend never recorded — the captain can retry,
+      // and the socket event will settle it if the write did land.
+      _log('settle failed for ${trip.id}: $e');
+    } finally {
+      if (!_disposed) {
+        _settling = false;
+        notifyListeners();
+      }
+    }
+  }
+
   /// The socket was refused for auth — the captain unlinked this tablet.
   Future<void> _onRevoked() async {
     if (_disposed || !_paired) return;
@@ -330,6 +473,9 @@ class RideController extends ChangeNotifier {
   /// let itself back in on the next launch.
   Future<void> signOut() async {
     await DeviceTokenStore.clear();
+    // Otherwise a tablet re-paired into another vehicle greets the captain who
+    // used to drive this one.
+    await CaptainStore.clear();
     _closeSocket();
     _generation++;
     _captain = null;
@@ -338,6 +484,8 @@ class RideController extends ChangeNotifier {
     _trip = null;
     _captainPosition = null;
     _lastTrackerFixAt = null;
+    _paymentOutcome = null;
+    _paymentStatus = null;
     // Otherwise the only ride state to survive an unpair: a tablet moved from
     // a tracker car into a GPS one would start with the old car's answer.
     _locationSource = null;
@@ -356,6 +504,10 @@ class RideController extends ChangeNotifier {
     _generation++;
     _trip = trip;
     _phase = RidePhase.inProgress;
+    // A new fare, outstanding again — the previous ride's outcome must not
+    // carry over and show this one as already paid.
+    _paymentOutcome = null;
+    _paymentStatus = null;
     notifyListeners();
 
     // A ride can start from a socket event on a tablet that has never synced,
@@ -422,6 +574,8 @@ class RideController extends ChangeNotifier {
     _generation++;
     _trip = null;
     _phase = RidePhase.welcome;
+    _paymentOutcome = null;
+    _paymentStatus = null;
     notifyListeners();
   }
 

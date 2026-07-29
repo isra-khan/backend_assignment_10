@@ -50,4 +50,32 @@ class Captain {
       seats: int.tryParse(json['seats']?.toString() ?? '') ?? 4,
     );
   }
+
+  /// Flatten for local storage. Deliberately NOT the wire shape: the pairing
+  /// response nests the name under `fullname: {firstname, lastname}`, and
+  /// re-encoding that on the way out would mean two formats to keep in step.
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'phone': phone,
+        'vehicleType': vehicleType,
+        'vehicleNumber': vehicleNumber,
+        'vehicleColor': vehicleColor,
+        'seats': seats,
+      };
+
+  /// Read back what [toJson] wrote. Separate from [Captain.fromPairing] because
+  /// the two shapes differ in the one field that matters — a flat `name` here
+  /// against a nested `fullname` on the wire — and a single lenient parser
+  /// would silently yield "Captain" whenever the wrong one was handed in.
+  factory Captain.fromStored(Map<String, dynamic> json) {
+    final name = json['name']?.toString().trim() ?? '';
+    return Captain(
+      name: name.isEmpty ? 'Captain' : name,
+      phone: json['phone']?.toString() ?? '',
+      vehicleType: json['vehicleType']?.toString() ?? 'car',
+      vehicleNumber: json['vehicleNumber']?.toString() ?? '',
+      vehicleColor: json['vehicleColor']?.toString() ?? '',
+      seats: int.tryParse(json['seats']?.toString() ?? '') ?? 4,
+    );
+  }
 }

@@ -6,6 +6,7 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 import '../config/env.dart';
 import '../models/trip.dart';
 import 'device_token_store.dart';
+import 'payment_service.dart' show PaymentOutcome;
 
 /// A position pushed by the vehicle's tracker over `my-location`.
 ///
@@ -89,6 +90,7 @@ class RideSocket {
   RideSocket({
     required this.onEvent,
     required this.onLocation,
+    required this.onPayment,
     required this.onReconnect,
     required this.onRevoked,
   });
@@ -99,6 +101,11 @@ class RideSocket {
   /// A tracker position arrived. Only meaningful when `locationSource` is
   /// `tracker`; the controller drops it otherwise.
   final void Function(TrackerFix) onLocation;
+
+  /// The fare was settled — paid or disputed — for the ride identified by the
+  /// second argument. Null when the payload carried no id, in which case the
+  /// controller applies it to the trip on screen.
+  final void Function(PaymentOutcome, String?) onPayment;
 
   /// The socket came back after a drop. Events were missed in the gap, so the
   /// screen has to be rebuilt from the snapshot endpoint.
@@ -167,6 +174,18 @@ class RideSocket {
     socket.on(
         'ride-cancelled', (d) => _emit('ride-cancelled', RideEvent.cancelled, d));
 
+    // Payment outcomes. Both carry `rideId`; the controller drops any that
+    // aren't for the trip on screen, so a late event from a previous ride can't
+    // clear the current one.
+    socket.on('payment-received', (d) {
+      _log('payment-received', d);
+      onPayment(PaymentOutcome.paid, _rideIdFrom(d));
+    });
+    socket.on('payment-disputed', (d) {
+      _log('payment-disputed', d);
+      onPayment(PaymentOutcome.disputed, _rideIdFrom(d));
+    });
+
     socket.on('my-location', (d) {
       final fix = TrackerFix.fromJson(d);
       // Logged either way: a payload that fails to parse is invisible
@@ -194,6 +213,17 @@ class RideSocket {
     socket.on('ride-taken', (d) => _log('ride-taken', d, note: 'ignored'));
 
     socket.connect();
+  }
+
+  /// The ride a payment event refers to. Tolerates `rideId`, a bare `_id`, or
+  /// one nested under `ride` — the same leniency [RideController] applies to
+  /// lifecycle payloads, whose exact shapes the guide doesn't pin down.
+  static String? _rideIdFrom(dynamic data) {
+    if (data is! Map) return null;
+    final direct = data['rideId'] ?? data['_id'];
+    if (direct != null) return direct.toString();
+    final ride = data['ride'];
+    return ride is Map ? (ride['_id'] ?? ride['rideId'])?.toString() : null;
   }
 
   void _emit(String name, RideEvent event, dynamic data) {

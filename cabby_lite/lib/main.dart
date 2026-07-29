@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show DeviceOrientation, SystemChrome;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart'
     show MapboxOptions;
@@ -13,6 +14,15 @@ import 'state/ride_controller.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Landscape only, on every screen. A tablet bracketed to a windscreen must
+  // not reflow mid-ride because the car took a corner — and the map screen in
+  // particular rebuilds its camera framing on a size change.
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
+
   // lib/.env carries the Mapbox token and the backend URL. Load it before
   // runApp: the map renders blank without the token, and pairing can't start
   // without the server URL.
