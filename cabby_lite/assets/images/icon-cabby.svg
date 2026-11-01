@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Cabby Ride">
-  <rect width="64" height="64" rx="14" fill="#0A7C42"/>
-  <!-- Route mark: a 250° arc opening right, reading as both a C and a route. -->
-  <path d="M 42.76,47.36 A 18.75,18.75 0 1 1 42.76,16.64"
-        fill="none" stroke="#FFFFFF" stroke-width="8.25" stroke-linecap="round"/>
-  <!-- Leading tip, the moving end of the route. -->
-  <path d="M 33.63,13.19 A 18.75,18.75 0 0 1 42.76,16.64"
-        fill="none" stroke="#27C281" stroke-width="8.25" stroke-linecap="round"/>
-</svg>
